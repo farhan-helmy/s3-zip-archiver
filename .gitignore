@@ -1,0 +1,21 @@
+# SAM build artifacts
+.aws-sam/
+packaged.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Local environment
+.env
+*.local
+
+# Assessment brief - not ours to publish
+1.png
+
+# OS
+.DS_Store
