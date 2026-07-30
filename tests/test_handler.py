@@ -149,3 +149,33 @@ def test_multiple_records_in_one_event(s3, app):
     assert result["archived"] == 2
     assert object_exists(s3, "archive/a.json.zip")
     assert object_exists(s3, "archive/b.json.zip")
+
+
+def test_archives_default_to_standard_storage(s3, app):
+    put_source(s3, "incoming/result.json")
+
+    app.lambda_handler(s3_event(BUCKET, "incoming/result.json"), None)
+
+    head = s3.head_object(Bucket=BUCKET, Key="archive/result.json.zip")
+    # S3 omits the field entirely for STANDARD.
+    assert head.get("StorageClass", "STANDARD") == "STANDARD"
+
+
+def test_archives_honour_a_configured_storage_class(s3, monkeypatch):
+    """Archives are write-once, read-rarely, so a colder class is the cheaper home.
+
+    Configurable rather than hardcoded: GLACIER_IR carries a 90-day minimum
+    billing duration, which is the wrong trade for anything short-lived.
+    """
+    import importlib
+
+    import app as app_module
+
+    monkeypatch.setenv("ARCHIVE_STORAGE_CLASS", "GLACIER_IR")
+    app = importlib.reload(app_module)
+
+    put_source(s3, "incoming/result.json")
+    app.lambda_handler(s3_event(BUCKET, "incoming/result.json"), None)
+
+    head = s3.head_object(Bucket=BUCKET, Key="archive/result.json.zip")
+    assert head["StorageClass"] == "GLACIER_IR"

@@ -43,6 +43,14 @@ ARCHIVE_PREFIX = os.environ.get("ARCHIVE_PREFIX", "archive/")
 # marginal gain on JSON. See the cost analysis in README.md.
 COMPRESSION_LEVEL = int(os.environ.get("COMPRESSION_LEVEL", "6"))
 
+# Storage class for the archives. These are written once and read rarely - the
+# whole point of the feature is long-term retention - so leaving them in S3
+# Standard overpays substantially. GLACIER_IR costs roughly a fifth of Standard
+# per GB with millisecond retrieval, at the price of a 90-day minimum billing
+# duration and a 128 KB minimum billable object size. Defaults to STANDARD so the
+# behaviour is conservative unless deliberately changed; see README.md.
+ARCHIVE_STORAGE_CLASS = os.environ.get("ARCHIVE_STORAGE_CLASS", "STANDARD")
+
 # Objects are streamed rather than loaded whole. Anything under this threshold is
 # assembled in memory; larger payloads spill to /tmp automatically.
 SPOOL_MAX_BYTES = int(os.environ.get("SPOOL_MAX_BYTES", str(32 * 1024 * 1024)))
@@ -122,18 +130,19 @@ def compress_object(bucket: str, key: str) -> dict[str, Any] | None:
         compressed_bytes = buffer.tell()
         buffer.seek(0)
 
-        _s3.upload_fileobj(
-            buffer,
-            bucket,
-            destination_key,
-            ExtraArgs={
-                "ContentType": "application/zip",
-                "Metadata": {
-                    "source-key": key,
-                    "original-bytes": str(original_bytes),
-                },
+        extra_args = {
+            "ContentType": "application/zip",
+            "Metadata": {
+                "source-key": key,
+                "original-bytes": str(original_bytes),
             },
-        )
+        }
+        # Omitted rather than sent as "STANDARD" so the request matches what S3
+        # would do by default.
+        if ARCHIVE_STORAGE_CLASS != "STANDARD":
+            extra_args["StorageClass"] = ARCHIVE_STORAGE_CLASS
+
+        _s3.upload_fileobj(buffer, bucket, destination_key, ExtraArgs=extra_args)
     finally:
         buffer.close()
 

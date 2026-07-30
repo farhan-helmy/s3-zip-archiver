@@ -47,6 +47,22 @@ Parameters:
     Default: archive/
     Description: Archives are written here. Must differ from SourcePrefix.
 
+  ArchiveStorageClass:
+    Type: String
+    Default: STANDARD
+    AllowedValues:
+      - STANDARD
+      - STANDARD_IA
+      - INTELLIGENT_TIERING
+      - GLACIER_IR
+    Description: >
+      Storage class for archives. They are written once and read rarely, so
+      STANDARD overpays: GLACIER_IR is roughly a fifth of the per-GB price with
+      millisecond retrieval. The trade-offs are a 90-day minimum billing duration
+      and a 128 KB minimum billable object size, so it suits the steady archival
+      workload in the brief but not short-lived or tiny objects. Defaults to
+      STANDARD; see the cost analysis in README.md.
+
   CompressionLevel:
     Type: Number
     Default: 6
@@ -304,6 +320,7 @@ Resources:
           SOURCE_PREFIX: !Ref SourcePrefix
           ARCHIVE_PREFIX: !Ref ArchivePrefix
           COMPRESSION_LEVEL: !Ref CompressionLevel
+          ARCHIVE_STORAGE_CLASS: !Ref ArchiveStorageClass
 
       Policies:
         # Bucket ARNs are built from the fixed name rather than !GetAtt on the
