@@ -254,18 +254,22 @@ Every deploy publishes an immutable Lambda version, and the S3 notification invo
 `live` **alias** rather than `$LATEST` — so moving the alias genuinely moves production
 traffic.
 
+Versions accumulate one per deploy, and each pins the exact image built from one commit —
+so a version number always maps back to a reviewable diff. After the first four deploys:
+
 ```
 $ aws lambda list-versions-by-function --function-name s3-zip-archiver-compressor
-1   2   3
+1   2   3   4
 
 $ aws lambda get-alias --function-name s3-zip-archiver-compressor --name live
-3
+4
 
-# each version pins the exact image built from one commit
-v1: s3-zip-archiver:bcec174
-v2: s3-zip-archiver:63cbb9c
-v3: s3-zip-archiver:031ab62
+$ # each version pins the image built from one commit
+v1: s3-zip-archiver:bcec174    v3: s3-zip-archiver:031ab62
+v2: s3-zip-archiver:63cbb9c    v4: s3-zip-archiver:94c1286
 ```
+
+Run `make versions` for the current state.
 
 ### The subtlety that makes this real
 
