@@ -189,6 +189,12 @@ Resources:
                   - cloudformation:ValidateTemplate
                 Resource:
                   - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${GitHubRepo}/*"
+                  # sam deploy --resolve-s3 provisions its artifact bucket through
+                  # a second, separate stack of its own. Scoping the policy to
+                  # this project's stack alone fails with AccessDenied on
+                  # CreateChangeSet against aws-sam-cli-managed-default before
+                  # the application stack is ever touched.
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/aws-sam-cli-managed-default/*"
                   - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31"
 
               # ECR: the authorization token endpoint is not resource-scopable,
