@@ -1,0 +1,430 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  s3-zip-archiver - compresses objects added to an S3 bucket into ZIP archives,
+  writes them back to the same bucket, and deletes the originals once verified.
+
+  Everything the brief asks for lives in this single stack: the VPC and its private
+  subnets, the S3 bucket, and the container-image Lambda that connects them.
+  (The ECR repository and CI deployment role are in bootstrap.yaml - a container
+  Lambda's image must exist before CloudFormation can create the function, so the
+  registry cannot be created by the stack that consumes it.)
+
+Parameters:
+  ImageUri:
+    Type: String
+    Description: >
+      Full ECR image URI including an immutable tag, e.g.
+      190930221916.dkr.ecr.ap-southeast-1.amazonaws.com/s3-zip-archiver:<git-sha>.
+      The tag must be unique per deploy: SAM publishes a new Lambda version only
+      when this string changes, so deploying :latest would silently produce no new
+      version and break rollback.
+
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+
+  PrivateSubnetACidr:
+    Type: String
+    Default: 10.20.1.0/24
+
+  PrivateSubnetBCidr:
+    Type: String
+    Default: 10.20.2.0/24
+
+  SourcePrefix:
+    Type: String
+    Default: incoming/
+    Description: >
+      Objects under this prefix trigger compression. The S3 notification filter
+      below is the primary defence against infinite recursion - the function
+      writes into the same bucket it reads from, so without this filter each
+      archive it produces would trigger another invocation, forever.
+
+  ArchivePrefix:
+    Type: String
+    Default: archive/
+    Description: Archives are written here. Must differ from SourcePrefix.
+
+  CompressionLevel:
+    Type: Number
+    Default: 6
+    MinValue: 1
+    MaxValue: 9
+    Description: >
+      Deflate level. 6 is zlib's default and sits at the knee of the curve -
+      level 9 costs materially more billed CPU for a marginal gain on JSON.
+
+  ReservedConcurrency:
+    Type: Number
+    Default: 10
+    Description: >
+      Caps simultaneous executions. Two reasons: it bounds the blast radius if a
+      recursion bug ever slipped past the prefix filter, and it stops this
+      function starving every other Lambda in the account of concurrency. At
+      production scale this becomes a bottleneck and would be raised - see the
+      scalability section of README.md.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    Description: >
+      Lambda log groups default to never expiring, which quietly becomes a real
+      cost line at high invocation volumes.
+
+Globals:
+  Function:
+    Timeout: 120
+    MemorySize: 1024
+    Tracing: Active
+
+Resources:
+  # ===========================================================================
+  # Networking
+  #
+  # Deliberately minimal: a VPC, two private subnets, and an S3 Gateway Endpoint.
+  # There is no Internet Gateway and no NAT Gateway.
+  #
+  # A Lambda in a private subnet has no route to the internet, so it cannot reach
+  # the public S3 endpoint. The usual reflex is to add a NAT Gateway. At the
+  # volume in the brief (1,000,000 objects/hour x 10 MB = ~10 TB/hour) NAT data
+  # processing at $0.045/GB would cost roughly $450 PER HOUR, for traffic that
+  # never needed to leave the AWS network. The S3 Gateway Endpoint does the same
+  # job as a route table entry, at no charge for either the endpoint or the data.
+  # ===========================================================================
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetACidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-a"
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetBCidr
+      # Second AZ so Lambda keeps placing ENIs if one availability zone degrades.
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-b"
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private"
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # The only way out of this VPC. Free, and traffic stays on the AWS backbone.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      # Scope the endpoint to this project's bucket only, so a compromised
+      # function in this VPC cannot use the endpoint to reach other buckets.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}"
+              - !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}/*"
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Egress-only group for the compressor Lambda.
+      VpcId: !Ref Vpc
+      # Restricted to HTTPS. With no Internet Gateway and no NAT attached to this
+      # VPC, the only reachable destination is the S3 Gateway Endpoint regardless.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to S3 via the gateway endpoint.
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-lambda-sg"
+
+  # ===========================================================================
+  # Storage
+  # ===========================================================================
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    # Retained so a stack delete cannot destroy customer data. Emptying and
+    # removing it is an explicit operator action - see `make destroy` in README.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Named explicitly rather than left to CloudFormation. SAM wires the S3
+      # notification into the bucket while the function's IAM policy needs the
+      # bucket ARN; if both sides used !Ref/!GetAtt the two resources would
+      # depend on each other and CloudFormation would refuse the template with a
+      # circular dependency error. Fixing the name lets the policy build the ARN
+      # as a string, breaking the cycle.
+      BucketName: !Sub "${AWS::StackName}-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      # Insurance against the destructive delete in the handler. If a bug ever
+      # caused a bad archive to be written and the original removed, the original
+      # is still recoverable as a noncurrent version.
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-noncurrent-versions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: abort-incomplete-multipart-uploads
+            Status: Enabled
+            # Failed multipart uploads are invisible in the console but billed.
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  # ===========================================================================
+  # Failure handling
+  # ===========================================================================
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-dlq"
+      MessageRetentionPeriod: 1209600 # 14 days, the maximum
+      SqsManagedSseEnabled: true
+
+  # ===========================================================================
+  # Compute
+  # ===========================================================================
+  CompressorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-compressor"
+      RetentionInDays: !Ref LogRetentionDays
+
+  CompressorFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      # Ensure the retention-managed log group exists before the function can be
+      # invoked, otherwise Lambda creates one with no expiry and the explicit
+      # resource collides with it.
+      - CompressorLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-compressor"
+      Description: Compresses newly added S3 objects into ZIP archives.
+      PackageType: Image
+      ImageUri: !Ref ImageUri
+      ImageConfig:
+        Command:
+          - app.lambda_handler
+
+      # Publishes an immutable version on every deploy and points the alias at it.
+      # Rollback is then a single UpdateAlias back to a prior version number.
+      # This only works because ImageUri changes each deploy (immutable git-SHA
+      # tags) - with a floating :latest tag CloudFormation would see no change
+      # and publish nothing.
+      AutoPublishAlias: live
+
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt LambdaSecurityGroup.GroupId
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+
+      Environment:
+        Variables:
+          SOURCE_PREFIX: !Ref SourcePrefix
+          ARCHIVE_PREFIX: !Ref ArchivePrefix
+          COMPRESSION_LEVEL: !Ref CompressionLevel
+
+      Policies:
+        # Bucket ARNs are built from the fixed name rather than !GetAtt on the
+        # bucket - see the circular dependency note on MediaBucket above.
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ReadAndDeleteSourceObjects
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:DeleteObject
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}/${SourcePrefix}*"
+            - Sid: WriteArchives
+              Effect: Allow
+              # No delete on the archive prefix: the function has no legitimate
+              # reason to remove an archive it has written.
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}/${ArchivePrefix}*"
+        # Manages the elastic network interfaces a VPC-attached Lambda needs.
+        - VPCAccessPolicy: {}
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DeadLetterQueue.QueueName
+
+      Events:
+        ObjectCreated:
+          Type: S3
+          Properties:
+            Bucket: !Ref MediaBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  # THE recursion guard. Archives are written under ArchivePrefix,
+                  # which does not match this filter, so S3 never emits an event
+                  # for them and the loop cannot start. Enforced by S3 itself,
+                  # before any Lambda invocation is billed.
+                  - Name: prefix
+                    Value: !Ref SourcePrefix
+
+  # ===========================================================================
+  # Observability
+  # ===========================================================================
+  FunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-compressor-errors"
+      AlarmDescription: >
+        Compression failures. Originals are never deleted on failure, so this
+        means objects are accumulating unprocessed rather than being lost.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CompressorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  DeadLetterQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-dlq-not-empty"
+      AlarmDescription: >
+        Events exhausted their retries. Each message identifies an object that
+        was never archived and needs replaying.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  ThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-compressor-throttles"
+      AlarmDescription: >
+        Invocations rejected for lack of concurrency. Expected to be the first
+        thing that breaks as volume grows - see README scalability section.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CompressorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  BucketName:
+    Description: Bucket that both receives originals and stores archives.
+    Value: !Ref MediaBucket
+
+  SourcePrefix:
+    Description: Upload objects here to trigger compression.
+    Value: !Ref SourcePrefix
+
+  ArchivePrefix:
+    Description: Compressed archives are written here.
+    Value: !Ref ArchivePrefix
+
+  FunctionName:
+    Value: !Ref CompressorFunction
+
+  FunctionAliasArn:
+    Description: Alias the S3 notification invokes. Roll back by repointing it.
+    Value: !Ref CompressorFunction.Alias
+
+  FunctionVersion:
+    Description: Version published by this deploy.
+    Value: !Ref CompressorFunction.Version
+
+  DeadLetterQueueUrl:
+    Value: !Ref DeadLetterQueue
+
+  VpcId:
+    Value: !Ref Vpc
+
+  PrivateSubnets:
+    Value: !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+
+  S3GatewayEndpointId:
+    Description: What lets a Lambda with no internet route reach S3, for free.
+    Value: !Ref S3GatewayEndpoint
