@@ -123,8 +123,45 @@ Resources:
                 # Without the aud check the role could be assumed by any GitHub
                 # workflow in any account.
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                # Scoped to one branch of one repository, not "repo:owner/repo:*".
-                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOwner}/${GitHubRepo}:ref:refs/heads/${GitHubBranch}"
+
+                # Pinned on the repository and ref claims rather than on sub.
+                #
+                # AWS's documentation, and essentially every guide online, tells
+                # you to match sub against "repo:OWNER/NAME:ref:refs/heads/BRANCH".
+                # GitHub has since moved to immutable subject claims that embed
+                # numeric IDs, so the token this repository actually presents is:
+                #
+                #   repo:farhan-helmy@59960562/s3-zip-archiver@1317606042:ref:refs/heads/main
+                #
+                # A sub-based policy written to the documented format therefore
+                # fails with "Not authorized to perform sts:AssumeRoleWithWebIdentity",
+                # and the numeric IDs are not knowable before the repository
+                # exists. This happens even though the repository still reports
+                # use_immutable_subject: false.
+                #
+                # repository and ref are separate signed claims in the same
+                # token, carry identical guarantees, and stay human-readable and
+                # stable. These two are what actually constrain the role, and
+                # they are exact matches: one branch of one repository.
+                token.actions.githubusercontent.com:repository: !Sub "${GitHubOwner}/${GitHubRepo}"
+                token.actions.githubusercontent.com:ref: !Sub "refs/heads/${GitHubBranch}"
+              StringLike:
+                # IAM will not accept a GitHub OIDC trust policy at all unless it
+                # constrains sub or job_workflow_ref:
+                #
+                #   "Trust policy with trusted principal ... must evaluate, using
+                #    StringEquals, StringLike or StringEqualsIgnoreCase,
+                #    token.actions.githubusercontent.com:sub or
+                #    token.actions.githubusercontent.com:job_workflow_ref which is
+                #    not scoped to all."
+                #
+                # So sub has to appear. The wildcards absorb the optional @<id>
+                # suffixes of the immutable format, matching both the legacy and
+                # current shapes. This is deliberately the loose half of the
+                # condition - "farhan-helmy*" would also match an attacker's
+                # "farhan-helmy-x" account - which is precisely why the exact
+                # repository match above is doing the real work. Both must pass.
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOwner}*/${GitHubRepo}*:ref:refs/heads/${GitHubBranch}"
       Policies:
         - PolicyName: DeployApplicationStack
           PolicyDocument:
