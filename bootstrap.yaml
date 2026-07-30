@@ -1,0 +1,276 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  One-time bootstrap for s3-zip-archiver. Creates the ECR repository that holds the
+  Lambda container image, and the IAM role GitHub Actions assumes via OIDC to deploy.
+
+  These resources are deliberately kept OUT of the application stack (template.yaml):
+  a container-image Lambda requires its image to already exist in ECR before
+  CloudFormation can create the function, so the repository cannot be created by the
+  same stack that consumes it. ECR and CI credentials also have a different lifecycle
+  from the application - they are created once and survive any number of app deploys.
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Default: farhan-helmy
+    Description: GitHub user or org that owns the repository.
+
+  GitHubRepo:
+    Type: String
+    Default: s3-zip-archiver
+    Description: Repository name allowed to assume the deployment role.
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: >
+      Only this branch may assume the deployment role. Pull requests run tests
+      and template validation only, and need no AWS credentials at all.
+
+  ExistingOidcProviderArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of an existing GitHub OIDC provider. An AWS account may only have one
+      provider per issuer URL, so if token.actions.githubusercontent.com is already
+      registered, pass its ARN here and this stack will reuse it rather than fail
+      with EntityAlreadyExists. Leave blank to create a new one.
+
+  EcrRepositoryName:
+    Type: String
+    Default: s3-zip-archiver
+    Description: Name of the ECR repository holding the Lambda image.
+
+  ImageRetentionCount:
+    Type: Number
+    Default: 10
+    Description: >
+      Number of recent images to keep. Every deploy pushes a new immutable image;
+      without expiry these accumulate indefinitely at $0.10/GB-month.
+
+Conditions:
+  CreateOidcProvider: !Equals [!Ref ExistingOidcProviderArn, ""]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Container registry for the Lambda image.
+  # ---------------------------------------------------------------------------
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref EcrRepositoryName
+      # Immutable tags mean a given git SHA always refers to exactly one image.
+      # This is what makes "every deploy publishes a new Lambda version" true:
+      # SAM only publishes a version when the ImageUri string changes, so tags
+      # must never be reused. CI checks whether a tag exists before pushing.
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Retain only the most recent ${ImageRetentionCount} images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": ${ImageRetentionCount}
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # ---------------------------------------------------------------------------
+  # GitHub Actions OIDC federation - no long-lived AWS access keys anywhere.
+  # ---------------------------------------------------------------------------
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      # AWS no longer validates these for the GitHub issuer, but the property
+      # remains required by CloudFormation.
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  GitHubActionsDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${GitHubRepo}-github-actions-deploy"
+      Description: Assumed by GitHub Actions via OIDC to deploy the application stack.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Ref ExistingOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                # Without the aud check the role could be assumed by any GitHub
+                # workflow in any account.
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                # Scoped to one branch of one repository, not "repo:owner/repo:*".
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOwner}/${GitHubRepo}:ref:refs/heads/${GitHubBranch}"
+      Policies:
+        - PolicyName: DeployApplicationStack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # CloudFormation, limited to this project's stacks plus the SAM
+              # transform macro that every SAM deploy must invoke.
+              - Sid: CloudFormationStackAccess
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ListStackResources
+                  - cloudformation:ValidateTemplate
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${GitHubRepo}/*"
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31"
+
+              # ECR: the authorization token endpoint is not resource-scopable,
+              # push/pull is restricted to this project's repository.
+              - Sid: EcrAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: EcrPushPull
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt EcrRepository.Arn
+
+              # SAM uploads the rendered template to its managed artifact bucket
+              # when the template exceeds the inline size limit.
+              - Sid: SamArtifactBucket
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:PutBucketPolicy
+                  - s3:PutBucketVersioning
+                  - s3:PutEncryptionConfiguration
+                  - s3:PutLifecycleConfiguration
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::aws-sam-cli-managed-*"
+                  - !Sub "arn:${AWS::Partition}:s3:::aws-sam-cli-managed-*/*"
+
+              # Resources the application stack creates and manages.
+              - Sid: ApplicationResources
+                Effect: Allow
+                Action:
+                  - lambda:*
+                  - sqs:*
+                  - cloudwatch:*
+                  - logs:*
+                  - s3:*
+                Resource: "*"
+
+              # VPC resources cannot be resource-scoped at creation time - the
+              # ARN does not exist until the API call succeeds.
+              - Sid: VpcResources
+                Effect: Allow
+                Action:
+                  - ec2:CreateVpc
+                  - ec2:DeleteVpc
+                  - ec2:ModifyVpcAttribute
+                  - ec2:CreateSubnet
+                  - ec2:DeleteSubnet
+                  - ec2:ModifySubnetAttribute
+                  - ec2:CreateRouteTable
+                  - ec2:DeleteRouteTable
+                  - ec2:AssociateRouteTable
+                  - ec2:DisassociateRouteTable
+                  - ec2:CreateVpcEndpoint
+                  - ec2:DeleteVpcEndpoints
+                  - ec2:ModifyVpcEndpoint
+                  - ec2:CreateSecurityGroup
+                  - ec2:DeleteSecurityGroup
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                  - ec2:Describe*
+                Resource: "*"
+
+              # PassRole is scoped to roles this project's stack creates, so the
+              # CI role cannot escalate by passing an unrelated privileged role.
+              - Sid: ManageStackRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${GitHubRepo}-*"
+
+Outputs:
+  EcrRepositoryUri:
+    Description: URI of the ECR repository holding the Lambda image.
+    Value: !GetAtt EcrRepository.RepositoryUri
+    Export:
+      Name: !Sub "${AWS::StackName}-EcrRepositoryUri"
+
+  EcrRepositoryArn:
+    Description: ARN of the ECR repository.
+    Value: !GetAtt EcrRepository.Arn
+
+  GitHubActionsRoleArn:
+    Description: >
+      Role ARN for the GitHub Actions workflow. Set this as the repository
+      variable AWS_DEPLOY_ROLE_ARN.
+    Value: !GetAtt GitHubActionsDeployRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-GitHubActionsRoleArn"
+
+  OidcProviderArn:
+    Description: OIDC provider trusted by the deployment role.
+    Value: !If
+      - CreateOidcProvider
+      - !Ref GitHubOidcProvider
+      - !Ref ExistingOidcProviderArn
