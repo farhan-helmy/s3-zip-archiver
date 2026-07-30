@@ -1,0 +1,52 @@
+name: CI
+
+# Runs on every pull request and on pushes to main. Deliberately requires no AWS
+# credentials at all: everything here is either static analysis or runs against
+# moto, so a fork PR can be validated safely and anyone cloning the repository
+# can reproduce the full check locally with `make check`.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install development dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint Python
+        run: ruff check src/ tests/ scripts/
+
+      - name: Lint CloudFormation
+        run: cfn-lint template.yaml bootstrap.yaml
+
+      - name: Unit tests
+        run: pytest -q
+
+  validate:
+    name: Validate SAM template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Validate template
+        # sam validate can parse and lint a template without credentials; the
+        # region is only needed to resolve region-specific pseudo-parameters.
+        run: sam validate --lint --region ap-southeast-1

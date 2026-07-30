@@ -1,0 +1,131 @@
+name: Deploy
+
+# Deploys on merge to main. Authenticates to AWS through GitHub's OIDC provider,
+# so there are no long-lived access keys stored in this repository - the workflow
+# exchanges a short-lived GitHub identity token for temporary AWS credentials, and
+# the IAM trust policy only accepts that exchange from this repository's main
+# branch. See bootstrap.yaml.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  # Required to request the OIDC token. Without it the credentials step fails.
+  id-token: write
+  contents: read
+
+# Serialise deploys: two concurrent runs would race to publish Lambda versions
+# and repoint the alias, leaving live traffic on whichever finished last rather
+# than on the newest commit.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-southeast-1
+  STACK_NAME: s3-zip-archiver
+  ECR_REPOSITORY: s3-zip-archiver
+
+jobs:
+  deploy:
+    name: Build image and deploy stack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve image tag
+        id: tag
+        # The image is tagged with the commit SHA, which is what makes the
+        # versioning requirement real: SAM publishes a new Lambda version only
+        # when the ImageUri string changes, so a floating tag like :latest would
+        # mean deploys silently produce no new version and nothing to roll back to.
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IMAGE="${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${SHORT_SHA}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Deploying ${IMAGE}"
+
+      - name: Check whether this commit's image already exists
+        id: exists
+        # The ECR repository uses IMMUTABLE tags, so re-running a workflow for a
+        # commit that was already built would fail on push. The image for a given
+        # commit is the same image, so skipping is correct rather than a fudge.
+        run: |
+          if aws ecr describe-images \
+               --repository-name "${ECR_REPOSITORY}" \
+               --image-ids imageTag="${{ steps.tag.outputs.short_sha }}" \
+               --region "${AWS_REGION}" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Image already present; skipping build and push."
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.exists.outputs.found == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        if: steps.exists.outputs.found == 'false'
+        # oci-mediatypes=false is required, not stylistic. BuildKit emits OCI
+        # manifests by default and Lambda rejects them at function-create time
+        # with "The image manifest, config or layer media type for the source
+        # image is not supported"; it needs Docker Image Manifest V2 Schema 2.
+        # Provenance and SBOM attestations are disabled for the same reason -
+        # they turn the push into a multi-manifest index.
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ steps.tag.outputs.image }},oci-mediatypes=false,push=true
+
+      - name: Deploy stack
+        run: |
+          sam deploy \
+            --stack-name "${STACK_NAME}" \
+            --capabilities CAPABILITY_IAM \
+            --parameter-overrides ImageUri="${{ steps.tag.outputs.image }}" \
+            --image-repository "${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}" \
+            --resolve-s3 \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --region "${AWS_REGION}"
+
+      - name: Report the published version
+        # Surfaces the version number in the run summary, so rolling back later
+        # does not require digging through CloudFormation to find what to roll
+        # back to.
+        run: |
+          VERSION=$(aws lambda get-alias \
+            --function-name "${STACK_NAME}-compressor" \
+            --name live --region "${AWS_REGION}" \
+            --query FunctionVersion --output text)
+          {
+            echo "### Deployed"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`${{ steps.tag.outputs.short_sha }}\` |"
+            echo "| Image | \`${{ steps.tag.outputs.image }}\` |"
+            echo "| Lambda version | \`${VERSION}\` |"
+            echo ""
+            echo "Roll back with: \`make rollback VERSION=<n>\`"
+          } >> "$GITHUB_STEP_SUMMARY"
