@@ -58,13 +58,18 @@ Parameters:
 
   ReservedConcurrency:
     Type: Number
-    Default: 10
+    Default: 0
     Description: >
-      Caps simultaneous executions. Two reasons: it bounds the blast radius if a
-      recursion bug ever slipped past the prefix filter, and it stops this
-      function starving every other Lambda in the account of concurrency. At
-      production scale this becomes a bottleneck and would be raised - see the
-      scalability section of README.md.
+      Caps simultaneous executions, bounding the blast radius if a recursion bug
+      ever slipped past the prefix filter and stopping this function starving
+      other Lambdas in the account.
+
+      Defaults to 0, meaning "do not reserve", because reserving is impossible on
+      a fresh account: AWS now provisions new accounts with a total Lambda
+      concurrency limit of 10 (it was 1000 historically) and refuses any
+      reservation that would drop unreserved concurrency below 10. Raise the
+      Service Quota first, then set this. See README.md - the account concurrency
+      ceiling is the single hardest scaling limit in this design.
 
   LogRetentionDays:
     Type: Number
@@ -72,6 +77,11 @@ Parameters:
     Description: >
       Lambda log groups default to never expiring, which quietly becomes a real
       cost line at high invocation volumes.
+
+Conditions:
+  # Omit ReservedConcurrentExecutions entirely when set to 0, rather than
+  # sending 0 - which would mean "throttle this function to zero invocations".
+  HasReservedConcurrency: !Not [!Equals [!Ref ReservedConcurrency, 0]]
 
 Globals:
   Function:
@@ -273,7 +283,10 @@ Resources:
       # and publish nothing.
       AutoPublishAlias: live
 
-      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      ReservedConcurrentExecutions: !If
+        - HasReservedConcurrency
+        - !Ref ReservedConcurrency
+        - !Ref "AWS::NoValue"
 
       VpcConfig:
         SecurityGroupIds:
