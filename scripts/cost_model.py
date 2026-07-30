@@ -92,33 +92,43 @@ def main() -> None:
     print(f"  sample original          {MEASURED_ORIGINAL_BYTES:>14,} bytes")
     print(f"  sample compressed        {MEASURED_COMPRESSED_BYTES:>14,} bytes")
     print(f"  reduction                {REDUCTION * 100:>14.2f} %")
-    print(f"  lambda duration (warm)   {LAMBDA_SECONDS_PER_FILE * 1000:>14.0f} ms at {LAMBDA_MEMORY_GB:.0f} GB")
+    print(f"  lambda duration (warm)   {LAMBDA_SECONDS_PER_FILE * 1000:>14.0f} ms"
+          f" at {LAMBDA_MEMORY_GB:.0f} GB")
     print()
     print("=" * 78)
     print("DERIVED MONTHLY VOLUME")
     print("=" * 78)
     print(f"  files / month            {FILES_PER_MONTH:>14,}")
-    print(f"  ingested                 {INGEST_GB_PER_MONTH:>14,.0f} GB  ({INGEST_GB_PER_MONTH / 1_000_000:.2f} PB)")
-    print(f"  archived                 {ARCHIVE_GB_PER_MONTH:>14,.0f} GB  ({ARCHIVE_GB_PER_MONTH / 1_000_000:.2f} PB)")
+    print(f"  ingested                 {INGEST_GB_PER_MONTH:>14,.0f} GB"
+          f"  ({INGEST_GB_PER_MONTH / 1_000_000:.2f} PB)")
+    print(f"  archived                 {ARCHIVE_GB_PER_MONTH:>14,.0f} GB"
+          f"  ({ARCHIVE_GB_PER_MONTH / 1_000_000:.2f} PB)")
     print(f"  storage avoided          {INGEST_GB_PER_MONTH - ARCHIVE_GB_PER_MONTH:>14,.0f} GB")
     print()
 
     # ---- Cost of running the feature -------------------------------------
-    lambda_compute = FILES_PER_MONTH * LAMBDA_MEMORY_GB * LAMBDA_SECONDS_PER_FILE * LAMBDA_GB_SECOND
+    lambda_compute = (
+        FILES_PER_MONTH * LAMBDA_MEMORY_GB * LAMBDA_SECONDS_PER_FILE * LAMBDA_GB_SECOND
+    )
     lambda_requests = FILES_PER_MONTH * LAMBDA_REQUEST
     s3_get = FILES_PER_MONTH * S3_GET
     s3_put = FILES_PER_MONTH * S3_PUT
     s3_delete = FILES_PER_MONTH * S3_DELETE
     logs = FILES_PER_MONTH * LOG_BYTES_PER_INVOCATION / 1e9 * CW_LOGS_INGEST_PER_GB
     alarms = 3 * CW_ALARM_MONTH
-    feature_total = lambda_compute + lambda_requests + s3_get + s3_put + s3_delete + logs + alarms
+    feature_total = (
+        lambda_compute + lambda_requests + s3_get + s3_put + s3_delete + logs + alarms
+    )
 
     print("=" * 78)
     print("A. RECURRING COST OF RUNNING THE FEATURE (per month)")
     print("=" * 78)
     print("| Component | Cost | Basis |")
     print("|---|---:|---|")
-    print(row("Lambda compute", lambda_compute, f"{FILES_PER_MONTH:,} x {LAMBDA_SECONDS_PER_FILE}s x {LAMBDA_MEMORY_GB:.0f}GB"))
+    compute_basis = (
+        f"{FILES_PER_MONTH:,} x {LAMBDA_SECONDS_PER_FILE}s x {LAMBDA_MEMORY_GB:.0f}GB"
+    )
+    print(row("Lambda compute", lambda_compute, compute_basis))
     print(row("Lambda requests", lambda_requests, f"{FILES_PER_MONTH:,} invocations"))
     print(row("S3 GET (read original)", s3_get, f"{FILES_PER_MONTH:,} requests"))
     print(row("S3 PUT (write archive)", s3_put, f"{FILES_PER_MONTH:,} requests"))
@@ -138,7 +148,8 @@ def main() -> None:
     print("=" * 78)
     print("| Scenario | Cost | Basis |")
     print("|---|---:|---|")
-    print(row("Uncompressed (today)", storage_without, f"{INGEST_GB_PER_MONTH:,.0f} GB S3 Standard"))
+    print(row("Uncompressed (today)", storage_without,
+              f"{INGEST_GB_PER_MONTH:,.0f} GB S3 Standard"))
     print(row("Compressed", storage_with, f"{ARCHIVE_GB_PER_MONTH:,.0f} GB S3 Standard"))
     print(row("**Saved**", storage_saved, f"{REDUCTION * 100:.1f}% less data"))
     print()
@@ -163,10 +174,12 @@ def main() -> None:
     print("| Option | Cost | Basis |")
     print("|---|---:|---|")
     print(row("S3 Gateway Endpoint (chosen)", 0.0, "no hourly and no data charge"))
-    print(row("NAT Gateway - data processing", nat_data, f"{nat_gb:,.0f} GB x ${NAT_GATEWAY_PER_GB}/GB"))
+    print(row("NAT Gateway - data processing", nat_data,
+              f"{nat_gb:,.0f} GB x ${NAT_GATEWAY_PER_GB}/GB"))
     print(row("NAT Gateway - hourly", nat_hours, f"2 AZs x {HOURS_PER_MONTH}h"))
     print(row("**NAT total**", nat_data + nat_hours, "for traffic that never leaves AWS"))
-    print(f"\n  Choosing the endpoint over a NAT Gateway avoids {money(nat_data + nat_hours)}/month,")
+    print("\n  Choosing the endpoint over a NAT Gateway avoids"
+          f" {money(nat_data + nat_hours)}/month,")
     print(f"  which alone exceeds the entire storage saving of {money(storage_saved)}.")
     print()
 

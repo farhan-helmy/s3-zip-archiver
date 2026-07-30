@@ -7,8 +7,9 @@ ECR_REPO        ?= s3-zip-archiver
 REGION          ?= ap-southeast-1
 PROFILE         ?= sk8jx
 
-AWS := aws --region $(REGION) --profile $(PROFILE)
-PY  := .venv/bin/python
+AWS  := aws --region $(REGION) --profile $(PROFILE)
+VENV := .venv/bin
+PY   := $(VENV)/python
 
 # The image tag is the commit SHA, and that is load-bearing rather than cosmetic.
 # SAM publishes a new Lambda version only when the ImageUri string changes, so a
@@ -38,8 +39,8 @@ test: ## Run unit tests (no AWS account required)
 
 .PHONY: lint
 lint: ## Lint Python and CloudFormation
-	$(PY) -m ruff check src/ tests/ scripts/
-	$(PY) -m cfn_lint template.yaml bootstrap.yaml
+	$(VENV)/ruff check src/ tests/ scripts/
+	$(VENV)/cfn-lint template.yaml bootstrap.yaml
 
 .PHONY: validate
 validate: ## Validate the SAM template
