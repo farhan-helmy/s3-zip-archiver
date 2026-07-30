@@ -60,8 +60,10 @@ flowchart LR
 
     ONPREM -->|upload JSON| INC
     INC -->|"ObjectCreated<br/>prefix filter: incoming/"| FN
-    FN --- L1 & L2
-    L1 & L2 --> EP
+    FN --> L1
+    FN --> L2
+    L1 --> EP
+    L2 --> EP
     EP -->|GET original| INC
     EP -->|PUT archive| ARC
     EP -.->|DELETE after verify| INC
