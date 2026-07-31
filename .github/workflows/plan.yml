@@ -64,7 +64,13 @@ jobs:
             --output text)
           PARAMS=$(grep -vE '^[[:space:]]*(#|$)' deploy.params | tr '\n' ' ')
 
-          sam deploy \
+          # No '|| true' here. Swallowing the exit status meant a plan that
+          # failed on permissions still reported success and posted an empty
+          # comment - a review gate that cannot fail is worse than no gate,
+          # because it gets trusted. --no-fail-on-empty-changeset already covers
+          # the legitimate "nothing to change" case, so any non-zero status left
+          # is a genuine failure.
+          if ! sam deploy \
             --stack-name "${STACK_NAME}" \
             --capabilities CAPABILITY_IAM \
             --parameter-overrides ImageUri="${IMAGE}" ${PARAMS} \
@@ -72,7 +78,11 @@ jobs:
             --resolve-s3 \
             --no-execute-changeset \
             --no-fail-on-empty-changeset \
-            --region "${AWS_REGION}" 2>&1 | tee plan.txt || true
+            --region "${AWS_REGION}" 2>&1 | tee plan.txt; then
+            echo "::error::Could not create the change set, so this pull request has not been previewed."
+            tail -20 plan.txt
+            exit 1
+          fi
 
           if grep -q "No changes to deploy" plan.txt; then
             echo "changed=false" >> "$GITHUB_OUTPUT"

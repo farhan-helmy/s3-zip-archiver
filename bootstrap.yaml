@@ -354,6 +354,10 @@ Resources:
                   - cloudformation:DescribeStackResourceDrifts
                 Resource:
                   - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${GitHubRepo}/*"
+                  # sam deploy --resolve-s3 provisions its artifact bucket through
+                  # a separate stack, so previewing a change needs access to that
+                  # stack too. The same omission broke the deploy role earlier.
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/aws-sam-cli-managed-default/*"
                   - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31"
 
               - Sid: PollDriftDetectionStatus
