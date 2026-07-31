@@ -20,6 +20,11 @@ ACCOUNT := $(shell aws sts get-caller-identity --query Account --output text --p
 ECR_URI  = $(ACCOUNT).dkr.ecr.$(REGION).amazonaws.com/$(ECR_REPO)
 IMAGE    = $(ECR_URI):$(GIT_SHA)
 
+# Every deploy passes the complete parameter set. SAM otherwise keeps whatever
+# the stack was last given, so a single ad-hoc override sticks forever while the
+# repository still claims the default. See deploy.params.
+PARAMS := $(shell grep -vE '^[[:space:]]*(#|$$)' deploy.params | tr '\n' ' ')
+
 .PHONY: help
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -95,16 +100,26 @@ image: guard-clean login ## Build and push the Lambda image tagged with the comm
 
 .PHONY: deploy
 deploy: image ## Build, push and deploy - publishes a new Lambda version
+	@echo "Parameters: ImageUri=$(IMAGE) $(PARAMS)"
 	sam deploy \
 		--stack-name $(STACK) \
 		--capabilities CAPABILITY_IAM \
-		--parameter-overrides ImageUri=$(IMAGE) \
+		--parameter-overrides ImageUri=$(IMAGE) $(PARAMS) \
 		--image-repository $(ECR_URI) \
 		--resolve-s3 \
 		--no-confirm-changeset \
 		--no-fail-on-empty-changeset \
 		--region $(REGION) --profile $(PROFILE)
 	@$(MAKE) --no-print-directory outputs
+
+.PHONY: config
+config: ## Show deployed parameters against what the repo declares
+	@echo "Declared in deploy.params:"
+	@grep -vE '^[[:space:]]*(#|$$)' deploy.params | sed 's/^/  /'
+	@echo "\nCurrently deployed:"
+	@$(AWS) cloudformation describe-stacks --stack-name $(STACK) \
+		--query 'Stacks[0].Parameters[?ParameterKey!=`ImageUri`].[ParameterKey,ParameterValue]' \
+		--output text | awk '{printf "  %s=%s\n", $$1, $$2}'
 
 .PHONY: outputs
 outputs: ## Show stack outputs

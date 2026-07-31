@@ -98,11 +98,18 @@ jobs:
           outputs: type=image,name=${{ steps.tag.outputs.image }},oci-mediatypes=false,push=true
 
       - name: Deploy stack
+        # The full parameter set is passed on every deploy, not just ImageUri.
+        # SAM keeps the stack's previous value for anything omitted, so a single
+        # ad-hoc override would stick permanently while the repository still
+        # showed the default, with nothing in git recording the difference.
+        # Passing everything makes deploy.params the source of truth.
         run: |
+          PARAMS=$(grep -vE '^[[:space:]]*(#|$)' deploy.params | tr '\n' ' ')
+          echo "Parameters: ImageUri=${{ steps.tag.outputs.image }} ${PARAMS}"
           sam deploy \
             --stack-name "${STACK_NAME}" \
             --capabilities CAPABILITY_IAM \
-            --parameter-overrides ImageUri="${{ steps.tag.outputs.image }}" \
+            --parameter-overrides ImageUri="${{ steps.tag.outputs.image }}" ${PARAMS} \
             --image-repository "${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}" \
             --resolve-s3 \
             --no-confirm-changeset \

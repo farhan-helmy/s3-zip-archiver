@@ -1,0 +1,42 @@
+# Deployed configuration. One CloudFormation parameter per line.
+#
+# This file is the single source of truth for how the stack is configured, and
+# it exists because of a trap in how SAM handles parameters.
+#
+# SAM keeps the stack's *previous* value for any parameter not passed on a
+# deploy. A one-off `--parameter-overrides ArchiveStorageClass=GLACIER_IR`
+# therefore sticks permanently, and every later deploy silently preserves it -
+# while the template still reads `Default: STANDARD` and nothing in git records
+# the difference. The only way to discover the drift is to ask CloudFormation.
+#
+# The obvious fix, putting the parameters in samconfig.toml, does not work:
+# passing `--parameter-overrides` on the command line replaces that file's list
+# outright rather than merging with it. Since ImageUri must be passed on every
+# deploy, samconfig's parameters would always be discarded. Verified, not
+# assumed.
+#
+# So both `make deploy` and the GitHub Actions workflow read this file and pass
+# every line, plus ImageUri. Each deploy states the complete intended
+# configuration, the stack always matches this file, and changing config is an
+# ordinary commit: edit, review, merge, deploy, `git revert` if wrong.
+#
+# ImageUri is deliberately absent - it is the one parameter that must differ per
+# deploy, and it is supplied as the commit SHA.
+
+# zlib's default, and a measured choice rather than an untouched one. On a
+# representative 10 MB payload, level 9 achieved 83.95% against level 6's
+# 83.19% - 0.76 percentage points better - for 3.5x the CPU time. Lambda bills
+# by the millisecond, so level 9 costs more in compute than it saves in storage.
+CompressionLevel=6
+
+# STANDARD, GLACIER_IR, STANDARD_IA or INTELLIGENT_TIERING. GLACIER_IR is around
+# a fifth of the per-GB price, but PUTs to it cost 4x more, which cancels roughly
+# half the saving at this object count. See the cost analysis in README.md.
+ArchiveStorageClass=STANDARD
+
+# 0 means "do not reserve". This account's total Lambda concurrency limit is 10,
+# and reserving anything would leave less than the 10 unreserved that Lambda
+# requires. Raise the Service Quota before setting this.
+ReservedConcurrency=0
+
+LogRetentionDays=14

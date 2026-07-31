@@ -299,6 +299,21 @@ Resources:
       # and publish nothing.
       AutoPublishAlias: live
 
+      # Without this, AutoPublishAlias keys the version on ImageUri alone, so a
+      # configuration-only change - compression level, storage class, memory,
+      # timeout - updates $LATEST and publishes nothing. The alias keeps serving
+      # the previous version, and the deploy reports success while production
+      # continues running the old settings.
+      #
+      # Observed on this stack before the fix: CompressionLevel was changed from
+      # 6 to 9 and deployed cleanly. $LATEST read 9; the version behind the alias
+      # still read 6. The change never reached a single invocation.
+      #
+      # Setting this publishes a version whenever any property changes, which is
+      # what makes "every deployment is rollback-able" true for configuration as
+      # well as code.
+      AutoPublishAliasAllProperties: true
+
       ReservedConcurrentExecutions: !If
         - HasReservedConcurrency
         - !Ref ReservedConcurrency

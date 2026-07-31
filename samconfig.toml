@@ -1,0 +1,28 @@
+# Deployment defaults for the SAM CLI.
+#
+# Note what is NOT here: the stack's CloudFormation parameters. They live in
+# deploy.params instead, because passing `--parameter-overrides` on the command
+# line replaces this file's `parameter_overrides` outright rather than merging
+# with it. Since ImageUri must be supplied on every deploy, anything listed here
+# would be silently discarded on every deploy. Verified, not assumed - see the
+# comments in deploy.params.
+
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "s3-zip-archiver"
+region = "ap-southeast-1"
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+confirm_changeset = false
+fail_on_empty_changeset = false
+
+# image_repositories is deliberately absent too. SAM rejects a deploy that
+# specifies the image repository in both a config file and on the command line -
+# "Only one of the following can be provided" - and the Makefile and CI both
+# derive the registry from the account they are authenticated against rather
+# than hardcoding an account ID here.
+
+[default.build.parameters]
+cached = true
+parallel = true

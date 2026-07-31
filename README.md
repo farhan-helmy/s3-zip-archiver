@@ -284,12 +284,45 @@ Images are therefore tagged with the commit SHA and the ECR repository is config
 `IMMUTABLE`, so a tag can never be reused. `make deploy` refuses to run against a dirty
 worktree for the same reason: an image tagged with a commit must contain that commit.
 
+### Changing configuration
+
+Configuration lives in [`deploy.params`](deploy.params), which both `make deploy` and the
+CI workflow read. Changing it is an ordinary commit:
+
+```bash
+vim deploy.params          # e.g. ArchiveStorageClass=GLACIER_IR
+git commit -am "config: write archives to Glacier Instant Retrieval"
+git push                   # CI deploys it and publishes a new version
+make config                # declared vs actually deployed
+```
+
+Two things had to be fixed before that worked, and both were silent failures.
+
+**A config-only change published no version, so it never reached production.**
+`AutoPublishAlias` keys the version on `ImageUri` alone. Changing a parameter updated
+`$LATEST` while the alias carried on serving the old version, and the deploy reported
+success. Observed here: `CompressionLevel` was changed 6 → 9 and deployed cleanly;
+`$LATEST` read 9 and the version behind the alias still read 6. Not one invocation used the
+new setting. `AutoPublishAliasAllProperties: true` fixes it — a version is now published
+whenever any property changes.
+
+**Parameters are sticky, so the deployed config drifts from the repository.** SAM keeps the
+stack's previous value for anything not passed on a deploy, so a one-off
+`--parameter-overrides ArchiveStorageClass=GLACIER_IR` persists forever while the template
+still reads `Default: STANDARD` and git records nothing. Putting the parameters in
+`samconfig.toml` does not help either: a command-line `--parameter-overrides` replaces that
+file's list rather than merging with it, and since `ImageUri` must be passed every time,
+those values would always be discarded. Hence `deploy.params`, passed in full on every
+deploy, so the stack always matches the file. `make config` prints both to confirm.
+
 ### Rolling back
 
 ```bash
 make versions              # what exists, and what live currently serves
 make rollback VERSION=1    # repoint the alias — takes effect in seconds
 ```
+
+This covers configuration as well as code, now that config changes publish versions.
 
 Verified in practice: the alias was moved to version 1, the smoke test was re-run against
 it and passed (83.10% reduction, 4s latency), and the alias was then moved forward again.
@@ -457,6 +490,43 @@ lowering it would slow execution and may not reduce GB-seconds at all. This need
 across settings rather than assuming; it is the one number in this document I have not
 measured, and I would not change it without data.
 
+**7. Turning the compression dial up does not pay.** The obvious lever is the last one
+worth pulling. Measured on the same 10 MB payload:
+
+| Setting | Archive | Smaller | CPU time |
+|---|---:|---:|---:|
+| DEFLATE level 1 | 2,384,234 | 77.83% | 0.05 s |
+| DEFLATE level 6 (current) | 1,808,162 | 83.19% | 0.15 s |
+| DEFLATE level 9 | 1,726,395 | 83.95% | 0.55 s |
+| BZIP2 | **1,088,021** | **89.88%** | 0.67 s |
+| LZMA | 1,298,010 | 87.93% | 4.15 s |
+
+Level 9 buys **0.76 percentage points for 3.5× the CPU** — and Lambda bills by the
+millisecond, so it costs more in compute than it saves in storage. Level 6 stays.
+
+BZIP2 is the interesting one: 40% smaller archives than DEFLATE for 4.5× the CPU. Whether
+that pays depends entirely on **how long the data is kept**, because compute is charged
+once at ingest while storage is charged every month:
+
+| | Per month |
+|---|---:|
+| Storage saved by BZIP2 | ~$11,200 |
+| Extra Lambda compute | ~$32,000 |
+
+So BZIP2 loses money on month one and breaks even at roughly **three months of retention**.
+Beyond that it wins, and at a twelve-month retention it saves around $100,000 per monthly
+cohort. It also needs ~4.5× the concurrency for the same throughput, which matters given
+the account limit above. The right answer is genuinely "it depends on the retention
+policy", and that is a question for the business rather than the code.
+
+**8. The ratio is a property of the input, not the algorithm.** The same code achieves
+83% on this JSON and about 4% on a PNG, because a PNG is already entropy-coded and there is
+no redundancy left to find. For data that is already compressed — images, video, existing
+archives — no compression setting will help, and the lever is the storage class instead.
+Converting the JSON to a columnar format such as Parquet before compressing would beat any
+amount of algorithm tuning, because it removes the repeated keys rather than encoding them
+more cleverly.
+
 ### Assumptions, and where they would break
 
 These figures rest on the brief's stated numbers taken at face value. Worth stating plainly:
@@ -603,6 +673,29 @@ An AWS account permits only one OIDC provider per issuer URL, and this account a
 one. Creating it unconditionally fails with `EntityAlreadyExists`, so provider creation is
 conditional on a parameter.
 
+**6. A configuration change deployed successfully and changed nothing.**
+`AutoPublishAlias` publishes a version only when `ImageUri` changes, so altering a
+parameter updated `$LATEST` while the alias kept serving the previous version.
+`CompressionLevel` was set 6 → 9, CloudFormation reported success, `$LATEST` read 9 — and
+the version behind the alias still read 6. The setting reached zero invocations. Worse, the
+rollback story was quietly false for config: there was no version to roll back to. Fixed
+with `AutoPublishAliasAllProperties: true`.
+
+**7. Parameters are sticky, so the running stack drifts from the repository.**
+SAM keeps the stack's previous value for any parameter not passed. A single
+`--parameter-overrides ArchiveStorageClass=GLACIER_IR` therefore persisted across every
+later deploy while the template still read `Default: STANDARD`, with nothing in git
+recording it. The obvious fix of moving parameters into `samconfig.toml` does not work
+either — a command-line `--parameter-overrides` replaces that file's list outright, and
+`ImageUri` must be passed on every deploy, so those values are always discarded. Resolved
+with `deploy.params`, passed in full every time.
+
+**8. `samconfig.toml` and `--image-repository` cannot both specify the registry.**
+`Error: Only one of the following can be provided: '--image-repositories',
+'--image-repository', '--resolve-image-repos'.` The config file's entry was removed, since
+the Makefile and CI derive the registry from the authenticated account rather than
+hardcoding an ID.
+
 ---
 
 ## Repository layout
@@ -610,6 +703,8 @@ conditional on a parameter.
 ```
 ├── template.yaml              # application stack: VPC, bucket, Lambda, DLQ, alarms
 ├── bootstrap.yaml             # one-time: ECR repository, GitHub OIDC deploy role
+├── deploy.params              # deployed configuration — the source of truth
+├── samconfig.toml             # SAM CLI defaults (stack name, region, capabilities)
 ├── Makefile                   # build, deploy, smoke, rollback, teardown
 ├── src/
 │   ├── app.py                 # the handler
