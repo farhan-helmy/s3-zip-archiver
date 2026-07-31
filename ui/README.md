@@ -45,6 +45,29 @@ lines then arrive a few seconds later and appear in the feed as supplementary
 detail: the invocation record count, the ratio Lambda measured itself, and the
 execution report with duration and peak memory.
 
+## Downloading the archive
+
+Once a run finishes, **Download archive** pulls the ZIP back out of S3 through
+`/api/archive/download`. Unzip it however you like — the file is served as-is.
+
+This is the part that actually closes the loop. The original has been deleted by
+then, so opening the archive and finding the original content intact is the only
+remaining proof nothing was lost. Verified with the system `unzip`:
+
+```
+$ unzip -t downloaded.zip
+    testing: 1785470664196-download-test.json   OK
+No errors detected in compressed data of downloaded.zip.
+
+sent.json    2,150,362 bytes
+archive        370,974 bytes    82.75% smaller
+extracted    2,150,362 bytes    byte-identical to what was sent
+```
+
+The endpoint refuses any key outside the archive prefix. It is a local tool, but
+the key still arrives from the client and does not get to name arbitrary objects
+in the bucket.
+
 ## Why the stages don't come from the logs
 
 The first version of this tool read the compression stages out of CloudWatch

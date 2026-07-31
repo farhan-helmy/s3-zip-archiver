@@ -24,6 +24,7 @@ import {
   FilterLogEventsCommand,
 } from "@aws-sdk/client-cloudwatch-logs";
 import {
+  GetObjectCommand,
   HeadObjectCommand,
   PutObjectCommand,
   S3Client,
@@ -369,6 +370,51 @@ async function handleUpload(req: Request): Promise<Response> {
   return Response.json({ key, bytes: body.byteLength });
 }
 
+// ---------------------------------------------------------------------------
+// Archive download.
+//
+// This closes the loop: the original has been deleted by now, so pulling the
+// archive back out and opening it is the only way to confirm nothing was lost.
+// The file is served as-is for you to unzip yourself.
+// ---------------------------------------------------------------------------
+function archiveKeyFrom(req: Request): string {
+  if (!config) throw new Error("not connected");
+  const key = new URL(req.url).searchParams.get("key") ?? "";
+
+  // Local tool, but the key still comes from the client, so it does not get to
+  // name arbitrary objects in the bucket.
+  if (!key.startsWith(config.archivePrefix) || key.includes("..")) {
+    throw new Error(`key must sit under ${config.archivePrefix}`);
+  }
+  return key;
+}
+
+async function fetchArchive(key: string): Promise<Uint8Array> {
+  const result = await s3.send(
+    new GetObjectCommand({ Bucket: config!.bucket, Key: key }),
+  );
+  return result.Body!.transformToByteArray();
+}
+
+async function handleArchiveDownload(req: Request): Promise<Response> {
+  try {
+    const key = archiveKeyFrom(req);
+    const zip = await fetchArchive(key);
+    const filename = key.slice(key.lastIndexOf("/") + 1);
+
+    return new Response(zip, {
+      headers: {
+        "Content-Type": "application/zip",
+        "Content-Disposition": `attachment; filename="${filename}"`,
+        "Content-Length": String(zip.byteLength),
+      },
+    });
+  } catch (error) {
+    return Response.json({ error: (error as Error).message }, { status: 400 });
+  }
+}
+
+
 await loadConfig();
 
 const server = Bun.serve({
@@ -385,6 +431,7 @@ const server = Bun.serve({
         }),
     },
     "/api/upload": { POST: handleUpload },
+    "/api/archive/download": { GET: handleArchiveDownload },
     "/api/reconnect": {
       POST: async () => {
         await loadConfig();
