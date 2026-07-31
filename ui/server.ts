@@ -179,23 +179,26 @@ async function pollLogs(): Promise<void> {
       const message = (entry.message ?? "").trim();
       const structured = parseStructured(message);
 
+      // Log-derived events are supplementary confirmation, not the primary
+      // signal. CloudWatch Logs lag ingestion by 10-20 seconds while the
+      // pipeline itself finishes in 3-5, so a run reliably completes before its
+      // own log lines become readable. Anything the UI needs promptly is
+      // observed directly against S3 instead; these enrich the feed when they
+      // arrive.
       if (structured?.event === "invoked") {
         emit(
-          "trigger",
-          "Lambda invoked",
-          `S3 delivered ${structured.record_count} record(s) to the live alias`,
+          "log",
+          "Invocation confirmed in logs",
+          `Lambda received ${structured.record_count} record(s) on the live alias`,
           structured,
         );
       } else if (structured?.event === "archived") {
-        const original = Number(structured.original_bytes);
-        const compressed = Number(structured.compressed_bytes);
         emit(
-          "compress",
-          "Compressed and uploaded",
-          `${fmtBytes(original)} to ${fmtBytes(compressed)}`,
+          "log",
+          "Lambda reported success",
+          `it measured ${(Number(structured.compression_ratio) * 100).toFixed(2)}% reduction`,
           structured,
         );
-        emit("verify", "Archive verified", "head_object confirmed non-zero size", structured);
       } else if (structured?.event?.toString().startsWith("skipped")) {
         emit("log", `Skipped: ${structured.event}`, String(structured.key ?? ""), structured);
       } else if (message.startsWith("REPORT")) {
@@ -239,7 +242,7 @@ async function exists(key: string): Promise<number | null> {
   }
 }
 
-async function watchObject(sourceKey: string): Promise<void> {
+async function watchObject(sourceKey: string, originalBytes: number): Promise<void> {
   if (!config) return;
 
   const name = sourceKey.slice(config.sourcePrefix.length);
@@ -256,6 +259,34 @@ async function watchObject(sourceKey: string): Promise<void> {
       const size = await exists(archiveKey);
       if (size !== null) {
         sawArchive = true;
+
+        // The archive existing is proof the function ran - there is no other way
+        // for it to appear. Stating that is more useful than leaving the stage
+        // blank for 20 seconds waiting for a log line to confirm what is already
+        // evident.
+        emit(
+          "trigger",
+          "Lambda ran",
+          "inferred: an archive cannot exist without an invocation",
+          { key: archiveKey },
+        );
+
+        // Both sizes are known here - the upload size and the archive size - so
+        // the ratio is computed from S3 itself rather than parsed out of a log
+        // line that has not arrived yet.
+        const ratio = originalBytes > 0 ? 1 - size / originalBytes : 0;
+        emit(
+          "compress",
+          "Compressed and uploaded",
+          `${fmtBytes(originalBytes)} to ${fmtBytes(size)} · ${(ratio * 100).toFixed(2)}% smaller`,
+          {
+            key: archiveKey,
+            original_bytes: originalBytes,
+            compressed_bytes: size,
+            compression_ratio: Number(ratio.toFixed(4)),
+          },
+        );
+
         emit("verify", "Archive present in S3", `${archiveKey} · ${fmtBytes(size)}`, {
           key: archiveKey,
           bytes: size,
@@ -334,7 +365,7 @@ async function handleUpload(req: Request): Promise<Response> {
     { key },
   );
 
-  void watchObject(key);
+  void watchObject(key, body.byteLength);
   return Response.json({ key, bytes: body.byteLength });
 }
 

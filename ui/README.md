@@ -34,15 +34,41 @@ startup, so this follows the deployment rather than drifting from it.
 Drop a file in, or generate a sample of a chosen size in the browser. Then:
 
 1. **Upload** — the server PUTs the object under `incoming/`
-2. **S3 event** — read from the Lambda's `{"event": "invoked"}` log line
-3. **Compress** — read from `{"event": "archived"}`, including the real ratio
-4. **Verify** — the archive is confirmed present in S3 by `head_object`
+2. **Lambda ran** — inferred, because an archive cannot exist without an invocation
+3. **Compress** — with the real ratio, computed from the two S3 object sizes
+4. **Verify** — the archive confirmed present by `head_object`
 5. **Delete original** — confirmed by the original returning 404
 6. **Done** — with end-to-end timing
 
-Stages 2 and 3 come from the function's own structured logs. Stages 4 and 5 are
-verified independently against S3 rather than trusted from the log line that
-claims them — the same reasoning as the handler's own verify-before-delete.
+Every one of those is observed directly against S3. The function's structured log
+lines then arrive a few seconds later and appear in the feed as supplementary
+detail: the invocation record count, the ratio Lambda measured itself, and the
+execution report with duration and peak memory.
+
+## Why the stages don't come from the logs
+
+The first version of this tool read the compression stages out of CloudWatch
+Logs, and it was wrong in a way worth recording.
+
+**CloudWatch Logs lag ingestion by roughly 10 seconds. The pipeline finishes in
+3–5.** So a run reliably completed *before* its own log lines became readable,
+and the UI showed a finished pipeline with two stages still blank. Measured
+during development:
+
+```
+11:16:28  upload / trigger / compress / verify / cleanup / done   ← S3-observed
+11:16:38  invocation, ratio, execution report                     ← CloudWatch, 9s later
+```
+
+The fix was to stop depending on logs for anything time-sensitive. The upload
+size is known because the server sent it, and the archive size comes back from
+`head_object` — so the ratio is available immediately, from the source of truth,
+without parsing a log line that hasn't arrived.
+
+This leaves a useful property: the ratio computed from S3 object sizes and the
+ratio Lambda calculated internally are derived independently and shown side by
+side. They agree, which is a real cross-check rather than the same number
+displayed twice.
 
 ## How "real time" works here, honestly
 
@@ -55,10 +81,9 @@ events to a laptop, and the alternatives — an API Gateway WebSocket API, or
 EventBridge to a subscriber — would mean deploying extra infrastructure into an
 account this tool deliberately does not modify.
 
-The practical effect is that events appear within roughly a second of happening,
-which is well inside the 3–5 second pipeline. But it is polling behind a
-WebSocket, not a push pipeline end to end, and it would be wrong to present it as
-one.
+The practical effect is that stages appear within about a second of happening.
+But it is polling behind a WebSocket, not a push pipeline end to end, and it
+would be wrong to present it as one.
 
 ## Cost
 
