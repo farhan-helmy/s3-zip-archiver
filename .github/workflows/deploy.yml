@@ -13,7 +13,10 @@ on:
 permissions:
   # Required to request the OIDC token. Without it the credentials step fails.
   id-token: write
-  contents: read
+  # write, not read: each deploy publishes a release tagging the commit with the
+  # Lambda version it produced, so the mapping is visible in GitHub rather than
+  # only inside AWS.
+  contents: write
 
 # Serialise deploys: two concurrent runs would race to publish Lambda versions
 # and repoint the alias, leaving live traffic on whichever finished last rather
@@ -116,23 +119,49 @@ jobs:
             --no-fail-on-empty-changeset \
             --region "${AWS_REGION}"
 
-      - name: Report the published version
-        # Surfaces the version number in the run summary, so rolling back later
-        # does not require digging through CloudFormation to find what to roll
-        # back to.
+      - name: Tag the commit with the Lambda version it produced
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Without this, the mapping from Lambda version to commit lives only in
+        # ECR image tags, so answering "what is version 8, and what would I be
+        # reverting to?" means querying AWS. Publishing a release per deploy puts
+        # that mapping in GitHub, which turns the Releases page into the list of
+        # things the Rollback workflow can target.
         run: |
           VERSION=$(aws lambda get-alias \
             --function-name "${STACK_NAME}-compressor" \
             --name live --region "${AWS_REGION}" \
             --query FunctionVersion --output text)
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
           {
-            echo "### Deployed"
+            echo "**Lambda version \`${VERSION}\`** from commit"
+            echo "\`${{ steps.tag.outputs.short_sha }}\`."
             echo ""
             echo "| | |"
             echo "|---|---|"
-            echo "| Commit | \`${{ steps.tag.outputs.short_sha }}\` |"
-            echo "| Image | \`${{ steps.tag.outputs.image }}\` |"
             echo "| Lambda version | \`${VERSION}\` |"
+            echo "| Commit | ${{ github.sha }} |"
+            echo "| Image | \`${{ steps.tag.outputs.image }}\` |"
             echo ""
-            echo "Roll back with: \`make rollback VERSION=<n>\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo "### Rolling back to this release"
+            echo ""
+            echo "Run the **Rollback** workflow with \`version: ${VERSION}\`, or:"
+            echo ""
+            echo '```'
+            echo "make rollback VERSION=${VERSION}"
+            echo '```'
+          } > notes.md
+
+          # Idempotent: re-running a deploy for the same version should not fail.
+          if gh release view "lambda-v${VERSION}" >/dev/null 2>&1; then
+            gh release edit "lambda-v${VERSION}" --notes-file notes.md
+          else
+            gh release create "lambda-v${VERSION}" \
+              --title "Lambda version ${VERSION}" \
+              --notes-file notes.md \
+              --target "${GITHUB_SHA}"
+          fi
+
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"

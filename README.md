@@ -317,12 +317,38 @@ deploy, so the stack always matches the file. `make config` prints both to confi
 
 ### Rolling back
 
+Every deploy publishes a GitHub release, `lambda-v<N>`, tagging the commit that produced
+it. So the **Releases page is the rollback menu** — picking a version means picking a commit
+you can read, rather than a number you have to go and look up in AWS.
+
+Roll back from the Actions tab by running the **Rollback** workflow with a version number
+and a reason, or locally:
+
 ```bash
 make versions              # what exists, and what live currently serves
-make rollback VERSION=1    # repoint the alias — takes effect in seconds
+make rollback VERSION=8
 ```
 
-This covers configuration as well as code, now that config changes publish versions.
+There are two ways to apply it, and the workflow asks which:
+
+| | `redeploy` (default) | `alias` |
+|---|---|---|
+| How | Redeploys that version's image via CloudFormation | Moves the alias directly |
+| Time | ~2 minutes | Seconds |
+| Result | Publishes a **new** version carrying the old image | Alias points at the old version |
+| Drift | None | Yes — stack disagrees with reality |
+
+**`redeploy` is the default and is usually right.** Because every version pins an
+immutable, commit-tagged image, redeploying that image reproduces the old code exactly
+while leaving CloudFormation as the source of truth. `make rollback` uses the fast path,
+which is the correct call when production is actively broken — but it bypasses
+CloudFormation, so the drift check will report it until the offending commit is reverted.
+
+Both roll back **code**. Configuration comes from `deploy.params` at HEAD, so reverting the
+commit is what rolls back config as well.
+
+Verified in practice: the alias was moved to version 1, the smoke test re-run against it
+and passed (83.10% reduction, 4 s), and the alias then moved forward again.
 
 Verified in practice: the alias was moved to version 1, the smoke test was re-run against
 it and passed (83.10% reduction, 4s latency), and the alias was then moved forward again.

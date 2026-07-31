@@ -1,0 +1,119 @@
+name: Plan
+
+# Answers the question a YAML diff cannot: what will merging this actually do to
+# AWS? A change set is created and described, never executed, and the result is
+# posted to the pull request. This is the CloudFormation equivalent of putting
+# `terraform plan` in front of a reviewer.
+#
+# The role used here cannot execute change sets - see GitHubActionsPlanRole in
+# bootstrap.yaml. Previewing a change and applying it are deliberately separate
+# permissions.
+on:
+  pull_request:
+    paths:
+      - "template.yaml"
+      - "deploy.params"
+      - "samconfig.toml"
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ap-southeast-1
+  STACK_NAME: s3-zip-archiver
+  ECR_REPOSITORY: s3-zip-archiver
+
+jobs:
+  plan:
+    name: Preview infrastructure changes
+    runs-on: ubuntu-latest
+    # Fork pull requests get no AWS credentials. A fork can propose changes but
+    # cannot borrow this account to evaluate them.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Create change set without executing it
+        id: plan
+        run: |
+          set -o pipefail
+
+          # Plan against the image that is currently deployed. The image URI
+          # changes on every commit by design, so including it would add a
+          # guaranteed Lambda modification to every plan and drown the signal
+          # that actually matters: what this PR does to infrastructure and
+          # configuration.
+          IMAGE=$(aws cloudformation describe-stacks --stack-name "${STACK_NAME}" \
+            --query 'Stacks[0].Parameters[?ParameterKey==`ImageUri`].ParameterValue' \
+            --output text)
+          PARAMS=$(grep -vE '^[[:space:]]*(#|$)' deploy.params | tr '\n' ' ')
+
+          sam deploy \
+            --stack-name "${STACK_NAME}" \
+            --capabilities CAPABILITY_IAM \
+            --parameter-overrides ImageUri="${IMAGE}" ${PARAMS} \
+            --image-repository "$(echo "${IMAGE}" | cut -d: -f1)" \
+            --resolve-s3 \
+            --no-execute-changeset \
+            --no-fail-on-empty-changeset \
+            --region "${AWS_REGION}" 2>&1 | tee plan.txt || true
+
+          if grep -q "No changes to deploy" plan.txt; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post the plan to the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "## Infrastructure plan"
+            echo ""
+            if [ "${{ steps.plan.outputs.changed }}" = "false" ]; then
+              echo "No infrastructure or configuration changes. Merging this will"
+              echo "still build and deploy a new image, publishing a new Lambda version."
+            else
+              echo "Merging this will apply the following to \`${STACK_NAME}\`:"
+              echo ""
+              echo '```'
+              # The change set table sits between these two markers in SAM output.
+              sed -n '/CloudFormation stack changeset/,/^Changeset created successfully/p' plan.txt \
+                | grep -vE '^-+$|^$' || echo "(see the workflow log for the full plan)"
+              echo '```'
+            fi
+            echo ""
+            echo "<sub>Planned against the currently deployed image, so the Lambda code"
+            echo "change every deploy makes is excluded. Change set created but not"
+            echo "executed - this workflow has no permission to apply it.</sub>"
+          } > comment.md
+
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --body-file comment.md --edit-last --create-if-none
+
+      - name: Clean up the change set
+        if: always()
+        run: |
+          # Change sets accumulate against the stack otherwise. Best effort:
+          # a stale change set is untidy, not dangerous.
+          for CS in $(aws cloudformation list-change-sets --stack-name "${STACK_NAME}" \
+                        --query 'Summaries[?Status!=`FAILED`].ChangeSetId' --output text); do
+            aws cloudformation delete-change-set --change-set-name "$CS" || true
+          done

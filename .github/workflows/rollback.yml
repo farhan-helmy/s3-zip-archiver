@@ -1,0 +1,160 @@
+name: Rollback
+
+# Rolls production back to a previously published Lambda version, from the
+# Actions tab, with an audit trail.
+#
+# Pick the target from the Releases page: every deploy publishes a
+# `lambda-v<N>` release tagging the commit that produced it, so choosing a
+# version is choosing a commit you can read.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Lambda version to roll back to (see Releases, e.g. 8)"
+        required: true
+        type: string
+      method:
+        description: "How to apply it"
+        required: true
+        default: redeploy
+        type: choice
+        options:
+          - redeploy
+          - alias
+      reason:
+        description: "Why (recorded in the run summary)"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+# Never let a rollback race a deploy. Same group as deploy.yml on purpose.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-southeast-1
+  STACK_NAME: s3-zip-archiver
+  ECR_REPOSITORY: s3-zip-archiver
+
+jobs:
+  rollback:
+    name: Roll back to version ${{ inputs.version }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Resolve the target version
+        id: target
+        run: |
+          FN="${STACK_NAME}-compressor"
+
+          CURRENT=$(aws lambda get-alias --function-name "$FN" --name live \
+            --query FunctionVersion --output text)
+          echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
+
+          if [ "$CURRENT" = "${{ inputs.version }}" ]; then
+            echo "::error::Alias already serves version ${{ inputs.version }}."
+            exit 1
+          fi
+
+          # Fails loudly if the version was never published, rather than
+          # producing a confusing error several steps later.
+          IMAGE=$(aws lambda get-function --function-name "$FN:${{ inputs.version }}" \
+            --query 'Code.ImageUri' --output text) || {
+              echo "::error::Version ${{ inputs.version }} does not exist. See: aws lambda list-versions-by-function --function-name $FN"
+              exit 1
+            }
+
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "Rolling back from version ${CURRENT} to ${{ inputs.version }} (${IMAGE})"
+
+      # --- the consistent path -------------------------------------------
+      - name: Redeploy the target version's image
+        if: inputs.method == 'redeploy'
+        # Every Lambda version pins an immutable, commit-tagged image, so
+        # redeploying that image through CloudFormation reproduces the old code
+        # exactly. This publishes a NEW version rather than reusing the old
+        # number, which is the point: CloudFormation stays the source of truth
+        # and no drift is created.
+        #
+        # Configuration comes from deploy.params at HEAD, so this rolls back
+        # code, not config. To roll back configuration as well, revert the commit.
+        run: |
+          PARAMS=$(grep -vE '^[[:space:]]*(#|$)' deploy.params | tr '\n' ' ')
+          sam deploy \
+            --stack-name "${STACK_NAME}" \
+            --capabilities CAPABILITY_IAM \
+            --parameter-overrides ImageUri="${{ steps.target.outputs.image }}" ${PARAMS} \
+            --image-repository "$(echo '${{ steps.target.outputs.image }}' | cut -d: -f1)" \
+            --resolve-s3 \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --region "${AWS_REGION}"
+
+      # --- the fast path --------------------------------------------------
+      - name: Move the alias
+        if: inputs.method == 'alias'
+        # Seconds rather than minutes, and the right call when production is
+        # actively broken. It bypasses CloudFormation, so it leaves the stack
+        # disagreeing with reality until someone reverts the commit properly -
+        # the scheduled drift check will report it as MODIFIED on
+        # AWS::Lambda::Alias.
+        run: |
+          aws lambda update-alias \
+            --function-name "${STACK_NAME}-compressor" \
+            --name live \
+            --function-version "${{ inputs.version }}" \
+            --query '[Name,FunctionVersion]' --output text
+
+      - name: Confirm and record
+        run: |
+          FN="${STACK_NAME}-compressor"
+          SERVING=$(aws lambda get-alias --function-name "$FN" --name live \
+            --query FunctionVersion --output text)
+          IMAGE=$(aws lambda get-function --function-name "$FN:$SERVING" \
+            --query 'Code.ImageUri' --output text)
+
+          {
+            echo "### Rolled back"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Was serving | \`${{ steps.target.outputs.current }}\` |"
+            echo "| Target | \`${{ inputs.version }}\` |"
+            echo "| Now serving | \`${SERVING}\` |"
+            echo "| Image | \`${IMAGE}\` |"
+            echo "| Method | \`${{ inputs.method }}\` |"
+            echo "| Reason | ${{ inputs.reason }} |"
+            echo "| By | @${{ github.actor }} |"
+            echo ""
+            if [ "${{ inputs.method }}" = "alias" ]; then
+              echo "> The alias was moved outside CloudFormation, so the stack now"
+              echo "> disagrees with reality and the drift check will report it."
+              echo "> Revert the offending commit to make the repository true again."
+            else
+              echo "Published as a new version carrying the old image, so"
+              echo "CloudFormation remains the source of truth and no drift was created."
+              echo ""
+              echo "This rolled back **code**. Configuration came from \`deploy.params\`"
+              echo "at HEAD - revert the commit to roll that back too."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ inputs.method }}" = "redeploy" ] && [ "$IMAGE" != "${{ steps.target.outputs.image }}" ]; then
+            echo "::error::Serving image ${IMAGE} does not match the requested ${{ steps.target.outputs.image }}"
+            exit 1
+          fi

@@ -292,6 +292,106 @@ Resources:
                   - iam:ListAttachedRolePolicies
                 Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${GitHubRepo}-*"
 
+  # ---------------------------------------------------------------------------
+  # A second, weaker role for previewing changes and detecting drift.
+  #
+  # Pull requests must be able to answer "what will this actually do to AWS?"
+  # without being able to do it. This role can create and read change sets but
+  # cannot execute them, cannot push images, and cannot touch IAM. The blast
+  # radius of it leaking is a stack full of unexecuted change sets.
+  # ---------------------------------------------------------------------------
+  GitHubActionsPlanRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${GitHubRepo}-github-actions-plan"
+      Description: >
+        Assumed by pull request and scheduled drift workflows. Read and preview
+        only - deliberately cannot execute a change set.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Ref ExistingOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                # As with the deploy role, the repository claim is the exact
+                # match doing the real work.
+                token.actions.githubusercontent.com:repository: !Sub "${GitHubOwner}/${GitHubRepo}"
+              StringLike:
+                # Two shapes, because two callers: pull requests carry
+                # ":pull_request", the scheduled drift check carries the branch
+                # ref. Wildcards absorb the immutable-claim @<id> suffixes.
+                token.actions.githubusercontent.com:sub:
+                  - !Sub "repo:${GitHubOwner}*/${GitHubRepo}*:pull_request"
+                  - !Sub "repo:${GitHubOwner}*/${GitHubRepo}*:ref:refs/heads/${GitHubBranch}"
+      Policies:
+        - PolicyName: PreviewAndDetectDrift
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PreviewChangesButNeverApplyThem
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ListStackResources
+                  # Drift detection is read-only despite the verb.
+                  - cloudformation:DetectStackDrift
+                  - cloudformation:DetectStackResourceDrift
+                  - cloudformation:DescribeStackDriftDetectionStatus
+                  - cloudformation:DescribeStackResourceDrifts
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${GitHubRepo}/*"
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31"
+
+              # Note the absence of ExecuteChangeSet, UpdateStack, CreateStack
+              # and DeleteStack. That absence is the entire point of this role.
+
+              - Sid: ReadStateForDriftDetection
+                Effect: Allow
+                Action:
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:GetAlias
+                  - lambda:ListVersionsByFunction
+                  - logs:DescribeLogGroups
+                  - cloudwatch:DescribeAlarms
+                  - sqs:GetQueueAttributes
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketPolicy
+                  - s3:GetEncryptionConfiguration
+                  - s3:GetLifecycleConfiguration
+                  - ec2:Describe*
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: "*"
+
+              - Sid: SamArtifactBucket
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::aws-sam-cli-managed-*"
+                  - !Sub "arn:${AWS::Partition}:s3:::aws-sam-cli-managed-*/*"
+
 Outputs:
   EcrRepositoryUri:
     Description: URI of the ECR repository holding the Lambda image.
@@ -310,6 +410,14 @@ Outputs:
     Value: !GetAtt GitHubActionsDeployRole.Arn
     Export:
       Name: !Sub "${AWS::StackName}-GitHubActionsRoleArn"
+
+  GitHubActionsPlanRoleArn:
+    Description: >
+      Preview and drift-detection role. Set this as the repository variable
+      AWS_PLAN_ROLE_ARN. Cannot execute change sets.
+    Value: !GetAtt GitHubActionsPlanRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-GitHubActionsPlanRoleArn"
 
   OidcProviderArn:
     Description: OIDC provider trusted by the deployment role.

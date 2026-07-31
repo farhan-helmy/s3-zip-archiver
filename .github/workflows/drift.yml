@@ -1,0 +1,125 @@
+name: Drift
+
+# CloudFormation will not tell you when someone changes something by hand, and
+# it will not correct it either - it compares the new template against the
+# previous template, never against reality. Drift therefore has to be gone
+# looking for, on a schedule, or it is discovered weeks later when an unrelated
+# deploy fails on a resource that no longer exists.
+#
+# This opens a GitHub issue when the stack stops matching the repository, which
+# keeps the signal in the same place as the code that caused it.
+on:
+  schedule:
+    # 02:00 UTC daily. Detection takes seconds and costs nothing.
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+env:
+  AWS_REGION: ap-southeast-1
+  STACK_NAME: s3-zip-archiver
+
+jobs:
+  detect:
+    name: Detect configuration drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Read and preview only. Detecting drift needs no ability to fix it,
+          # and fixing it automatically would defeat the point of noticing.
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Detect drift
+        id: drift
+        run: |
+          ID=$(aws cloudformation detect-stack-drift --stack-name "${STACK_NAME}" \
+                 --query StackDriftDetectionId --output text)
+
+          for _ in $(seq 1 40); do
+            read -r DETECTION STATUS COUNT <<< "$(aws cloudformation \
+              describe-stack-drift-detection-status --stack-drift-detection-id "$ID" \
+              --query '[DetectionStatus,StackDriftStatus,DriftedStackResourceCount]' \
+              --output text)"
+            [ "$DETECTION" = "DETECTION_IN_PROGRESS" ] || break
+            sleep 5
+          done
+
+          echo "Detection: $DETECTION | Stack: $STATUS | Drifted: $COUNT"
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+          if [ "$STATUS" = "DRIFTED" ]; then
+            aws cloudformation describe-stack-resource-drifts --stack-name "${STACK_NAME}" \
+              --stack-resource-drift-status-filters MODIFIED DELETED \
+              --query 'StackResourceDrifts[].[LogicalResourceId,ResourceType,StackResourceDriftStatus]' \
+              --output text > drifted.txt
+            aws cloudformation describe-stack-resource-drifts --stack-name "${STACK_NAME}" \
+              --stack-resource-drift-status-filters MODIFIED \
+              --query 'StackResourceDrifts[].PropertyDifferences[].[PropertyPath,ExpectedValue,ActualValue]' \
+              --output text > properties.txt
+            cat drifted.txt properties.txt
+          fi
+
+      - name: Raise an issue
+        if: steps.drift.outputs.status == 'DRIFTED'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "\`${STACK_NAME}\` no longer matches this repository."
+            echo "**${{ steps.drift.outputs.count }}** resource(s) drifted."
+            echo ""
+            echo "### Resources"
+            echo '```'
+            cat drifted.txt
+            echo '```'
+            if [ -s properties.txt ]; then
+              echo "### Properties (path, expected, actual)"
+              echo '```'
+              cat properties.txt
+              echo '```'
+            fi
+            echo ""
+            echo "### Fixing it"
+            echo "A redeploy will **not** correct this. CloudFormation compares the new"
+            echo "template against the previous one, not against reality, so an unchanged"
+            echo "template produces an empty change set and the drifted value survives."
+            echo ""
+            echo "- **Modified property:** change the value in \`deploy.params\` or"
+            echo "  \`template.yaml\` to something different, deploy, then change it back."
+            echo "  Two deploys, because CloudFormation needs a genuine diff to act on."
+            echo "- **Deleted resource:** recreate it manually under the same physical"
+            echo "  name, then deploy to reconcile. Left alone it will fail some later,"
+            echo "  unrelated deploy with \"not found and cannot be updated\", and can"
+            echo "  strand the stack in \`UPDATE_ROLLBACK_FAILED\`."
+            echo ""
+            echo "Then find out who changed it, in CloudTrail."
+            echo ""
+            echo "<sub>Raised by the scheduled drift check.</sub>"
+          } > body.md
+
+          EXISTING=$(gh issue list --label drift --state open \
+                       --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body-file body.md
+          else
+            gh label create drift --color B60205 \
+              --description "Deployed stack no longer matches the repository" 2>/dev/null || true
+            gh issue create --title "Drift detected in ${STACK_NAME}" \
+              --label drift --body-file body.md
+          fi
+
+      - name: Fail if drifted
+        if: steps.drift.outputs.status == 'DRIFTED'
+        run: |
+          echo "::error::${{ steps.drift.outputs.count }} resource(s) drifted from the repository."
+          exit 1
