@@ -622,10 +622,31 @@ conditional on a parameter.
 │   ├── smoke.sh               # end-to-end verification with round-trip integrity check
 │   ├── generate_sample.py     # representative video-analysis JSON
 │   └── cost_model.py          # every figure in the cost analysis
+├── ui/                        # local dev tool — not deployed, see below
 └── .github/workflows/
     ├── ci.yml                 # lint, test, validate — on every PR, no credentials
     └── deploy.yml             # OIDC auth, build, push, deploy — on merge to main
 ```
+
+## Live pipeline viewer (development tool)
+
+`ui/` contains a small Bun + React tool for watching the pipeline work: upload an
+object and see each stage light up as it is processed.
+
+**It is not part of the deployed system and changes nothing in AWS.** It runs
+locally, uses your own credentials, reads the bucket and function names from the
+stack outputs, and reports what it observes — Lambda's structured logs for the
+invocation and compression, and independent S3 checks for the archive appearing
+and the original being deleted.
+
+```bash
+cd ui && bun install && bun run dev      # http://localhost:4173
+```
+
+The browser connection is a real WebSocket, but the AWS side is polled roughly
+once a second — neither S3 nor Lambda pushes events to a laptop, and the
+alternative would mean deploying infrastructure this tool deliberately avoids
+touching. See [`ui/README.md`](ui/README.md).
 
 ## CI/CD
 
