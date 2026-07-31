@@ -385,6 +385,86 @@ CompressorFunctionAliaslive   AWS::Lambda::Alias   MODIFIED
 That is exactly what `make rollback` produces, and it is the honest cost of an emergency
 alias move: fast, but it leaves the stack disagreeing with reality until the next deploy.
 
+### What CloudFormation does about drift: nothing, and that surprises people
+
+This is the part worth understanding before someone changes something in the console, and
+every claim below was tested against this stack rather than read in a blog post.
+
+**CloudFormation compares the new template to the previous template, not to reality.** It
+has no equivalent of `terraform refresh`. If the template is unchanged, there is no
+changeset, and whatever was changed by hand simply stays.
+
+Log retention was set to 30 in the console against a template that says 14:
+
+```
+$ make drift
+CompressorLogGroup   AWS::Logs::LogGroup   /RetentionInDays   14   30
+
+$ make deploy                # identical template, identical parameters
+No changes to deploy. Stack s3-zip-archiver is up to date
+
+$ aws logs describe-log-groups ... --query 'logGroups[0].retentionInDays'
+30                           # still drifted
+```
+
+**Drift detection is a report, not a remediation.** There is no "fix drift" command.
+Correcting it means giving CloudFormation an actual diff, which means changing the value to
+something else and then changing it back — two deploys to restore one setting:
+
+```
+LogRetentionDays=7   ->  applied, now 7
+LogRetentionDays=14  ->  applied, now 14, back in sync
+```
+
+**A deleted resource is worse, because it fails later rather than now.** Deleting the
+throttle alarm by hand produced this sequence:
+
+1. `make drift` reported `ThrottleAlarm  AWS::CloudWatch::Alarm  DELETED`.
+2. Redeploying the identical template said `No changes to deploy`. The alarm was **not**
+   recreated. Monitoring was silently gone, and CI kept reporting green.
+3. A later, unrelated deploy that happened to touch that alarm failed:
+   `AWS::CloudWatch::Alarm [...] not found and cannot be updated`.
+4. The rollback then failed too, leaving the stack in **`UPDATE_ROLLBACK_FAILED`** — a
+   stuck state where no further deploy is possible at all.
+
+Recovery took three manual steps:
+
+```bash
+aws cloudformation continue-update-rollback --stack-name s3-zip-archiver \
+  --resources-to-skip ThrottleAlarm          # unstick the stack
+aws cloudwatch put-metric-alarm --alarm-name s3-zip-archiver-compressor-throttles ...
+                                             # recreate it with the same physical name
+make deploy                                  # CloudFormation reconciles it to the template
+```
+
+So the real cost of a console deletion is not the deletion. It is that the stack keeps
+reporting success until some unrelated change days later detonates, and the person holding
+it then has no idea why.
+
+### About renaming the bucket specifically
+
+**S3 buckets cannot be renamed.** There is no rename API — the only route is to create a new
+bucket and copy the objects across. So that particular ClickOps is impossible.
+
+The equivalent danger lives in the template. `BucketName` is a replacement property, so
+editing it in `template.yaml` does not rename anything: CloudFormation creates a **new,
+empty bucket** and detaches the old one. Because this bucket carries
+`DeletionPolicy: Retain`, the original survives with all its data — but it leaves the stack
+and nothing manages it any more. The pipeline would then be writing into an empty bucket
+while every existing archive sat in an orphan. Retain is what turns that from data loss
+into a mess.
+
+### Keeping ClickOps out
+
+Detection is the last line, not the first:
+
+- **Stack policies** can deny updates to nominated resources.
+- **SCPs or permission boundaries** stop console mutation on production accounts, which is
+  the actual fix — this repo's CI role is already scoped to named stacks rather than `*`.
+- **Scheduled drift detection** via EventBridge into an alarm turns drift into a page
+  rather than a discovery.
+- **CloudTrail** answers who did it, which matters more than what.
+
 One useful thing the processed template shows is how much SAM generates. The 15 resources
 written here expand to 19, with SAM adding the execution role, the S3 invoke permission,
 the alias, and the version — the last named `CompressorFunctionVersiona5dff950f6`. That

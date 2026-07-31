@@ -423,8 +423,11 @@ Resources:
     Properties:
       AlarmName: !Sub "${AWS::StackName}-compressor-throttles"
       AlarmDescription: >
-        Invocations rejected for lack of concurrency. Expected to be the first
-        thing that breaks as volume grows - see README scalability section.
+        Invocations rejected for lack of concurrency. This account's total Lambda
+        concurrency limit is 10, against roughly 211 concurrent executions the
+        brief's volume would need, so this is expected to be the first thing that
+        breaks as throughput grows. Raise the Service Quota before tuning
+        anything else. See the scalability section of README.md.
       Namespace: AWS/Lambda
       MetricName: Throttles
       Dimensions:
