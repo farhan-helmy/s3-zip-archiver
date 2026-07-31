@@ -165,6 +165,32 @@ rollback: ## Roll back to a prior version: make rollback VERSION=1
 # ---------------------------------------------------------------------------
 # Operations
 # ---------------------------------------------------------------------------
+.PHONY: drift
+drift: ## Detect resources changed outside CloudFormation
+	@echo "Detecting drift (takes ~15s)..."
+	@ID=$$($(AWS) cloudformation detect-stack-drift --stack-name $(STACK) \
+		--query StackDriftDetectionId --output text); \
+	while true; do \
+		STATUS=$$($(AWS) cloudformation describe-stack-drift-detection-status \
+			--stack-drift-detection-id $$ID \
+			--query '[DetectionStatus,StackDriftStatus,DriftedStackResourceCount]' \
+			--output text); \
+		case "$$STATUS" in \
+			DETECTION_IN_PROGRESS*) sleep 4 ;; \
+			*) echo "$$STATUS"; break ;; \
+		esac; \
+	done
+	@$(AWS) cloudformation describe-stack-resource-drifts --stack-name $(STACK) \
+		--stack-resource-drift-status-filters MODIFIED DELETED \
+		--query 'StackResourceDrifts[].[LogicalResourceId,ResourceType,StackResourceDriftStatus]' \
+		--output text
+	@$(AWS) cloudformation describe-stack-resource-drifts --stack-name $(STACK) \
+		--stack-resource-drift-status-filters MODIFIED \
+		--query 'StackResourceDrifts[].PropertyDifferences[].[PropertyPath,ExpectedValue,ActualValue]' \
+		--output text
+	@echo "\nNote: 'make rollback' moves the alias outside CloudFormation and will"
+	@echo "show here as drift on AWS::Lambda::Alias until you redeploy."
+
 .PHONY: dlq
 dlq: ## Show how many events failed permanently
 	@$(AWS) sqs get-queue-attributes \

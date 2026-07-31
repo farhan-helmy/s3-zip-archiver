@@ -359,6 +359,43 @@ fields @timestamp, source_key, original_bytes, compressed_bytes, compression_rat
 | stats avg(compression_ratio), sum(original_bytes - compressed_bytes) by bin(1h)
 ```
 
+### Detecting drift
+
+There is no state file to manage. SAM is a transform over CloudFormation, so the state is
+the stack itself, held server-side by AWS — no `terraform.tfstate`, no S3 backend, no
+DynamoDB lock table, and nothing to lose or corrupt. CloudFormation also stores the
+template it deployed, retrievable with `get-template`, which makes "what is actually
+deployed" answerable without trusting the working copy.
+
+Drift detection is built in and is the direct analogue of Terraform noticing out-of-band
+changes:
+
+```bash
+make drift
+```
+
+Real output, after deliberately moving the alias by hand:
+
+```
+DETECTION_COMPLETE   DRIFTED   1
+CompressorFunctionAliaslive   AWS::Lambda::Alias   MODIFIED
+/FunctionVersion   10   1   NOT_EQUAL
+```
+
+That is exactly what `make rollback` produces, and it is the honest cost of an emergency
+alias move: fast, but it leaves the stack disagreeing with reality until the next deploy.
+
+One useful thing the processed template shows is how much SAM generates. The 15 resources
+written here expand to 19, with SAM adding the execution role, the S3 invoke permission,
+the alias, and the version — the last named `CompressorFunctionVersiona5dff950f6`. That
+hash is derived from the function's properties, and it is the whole reason config changes
+published nothing before `AutoPublishAliasAllProperties`: the hash only covered `ImageUri`,
+so a config change produced an identical logical ID and therefore no new version.
+
+```bash
+aws cloudformation get-template --stack-name s3-zip-archiver --template-stage Processed
+```
+
 ### Teardown
 
 ```bash
