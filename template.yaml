@@ -246,6 +246,16 @@ Resources:
       # is still recoverable as a noncurrent version.
       VersioningConfiguration:
         Status: Enabled
+      # Cost allocation tags. The cost analysis in README.md is modelled rather
+       # than measured, because nothing in the account is tagged in a way that
+      # would let Cost Explorer separate this workload from the others sharing
+      # it. Tagging the two resources that actually accrue cost makes the
+      # modelled figures checkable against a real bill.
+      Tags:
+        - Key: project
+          Value: !Ref AWS::StackName
+        - Key: component
+          Value: storage
       LifecycleConfiguration:
         Rules:
           - Id: expire-noncurrent-versions
@@ -266,6 +276,11 @@ Resources:
       QueueName: !Sub "${AWS::StackName}-dlq"
       MessageRetentionPeriod: 1209600 # 14 days, the maximum
       SqsManagedSseEnabled: true
+      Tags:
+        - Key: project
+          Value: !Ref AWS::StackName
+        - Key: component
+          Value: failure-handling
 
   # ===========================================================================
   # Compute
