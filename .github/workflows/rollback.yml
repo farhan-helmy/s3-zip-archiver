@@ -80,7 +80,14 @@ jobs:
             }
 
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+          STACK_IMAGE=$(aws cloudformation describe-stacks --stack-name "${STACK_NAME}" \
+            --query 'Stacks[0].Parameters[?ParameterKey==`ImageUri`].ParameterValue' \
+            --output text)
+          echo "stack_image=${STACK_IMAGE}" >> "$GITHUB_OUTPUT"
+
           echo "Rolling back from version ${CURRENT} to ${{ inputs.version }} (${IMAGE})"
+          echo "CloudFormation currently records: ${STACK_IMAGE}"
 
       # --- the consistent path -------------------------------------------
       - name: Redeploy the target version's image
@@ -94,6 +101,21 @@ jobs:
         # Configuration comes from deploy.params at HEAD, so this rolls back
         # code, not config. To roll back configuration as well, revert the commit.
         run: |
+          # If CloudFormation already records this image, the deploy produces an
+          # empty change set, CloudFormation never touches the alias, and
+          # production stays where it is. Found by testing: after a fast-path
+          # alias rollback, the stack still recorded the newest image, so
+          # "redeploy back to it" was a silent no-op that left production on the
+          # old version.
+          #
+          # In that situation the discrepancy is drift, not a deployment, and the
+          # fix is to move the alias back to the version CloudFormation already
+          # expects - which removes the drift rather than adding to it.
+          if [ "${{ steps.target.outputs.stack_image }}" = "${{ steps.target.outputs.image }}" ]; then
+            echo "::error::CloudFormation already records ${{ steps.target.outputs.image }}, so a redeploy would change nothing and could not move the alias. The alias is currently on version ${{ steps.target.outputs.current }} while the stack expects ${{ inputs.version }} - that is drift from an earlier fast-path rollback. Re-run this workflow with method: alias to move it back, which also clears the drift."
+            exit 1
+          fi
+
           PARAMS=$(grep -vE '^[[:space:]]*(#|$)' deploy.params | tr '\n' ' ')
           sam deploy \
             --stack-name "${STACK_NAME}" \
