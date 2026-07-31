@@ -52,7 +52,7 @@ jobs:
                  --query StackDriftDetectionId --output text)
           [ -n "$ID" ] && [ "$ID" != "None" ] || { echo "::error::No detection id returned"; exit 1; }
 
-          DETECTION=""; STATUS=""; COUNT=""
+          DETECTION=""; STATUS=""; COUNT=""; REASON=""
           for _ in $(seq 1 40); do
             read -r DETECTION STATUS COUNT <<< "$(aws cloudformation \
               describe-stack-drift-detection-status --stack-drift-detection-id "$ID" \
@@ -62,13 +62,21 @@ jobs:
             sleep 5
           done
 
+          # Captured because a failed detection is otherwise opaque: the status
+          # alone says something went wrong but never what, and detection records
+          # expire before you can go and ask.
+          REASON=$(aws cloudformation describe-stack-drift-detection-status \
+            --stack-drift-detection-id "$ID" \
+            --query 'DetectionStatusReason' --output text 2>/dev/null || echo "unavailable")
+
           echo "Detection: $DETECTION | Stack: $STATUS | Drifted: $COUNT"
+          echo "Reason: $REASON"
 
           # Anything other than a completed detection with a recognised status
           # means we do not know the answer, and "we do not know" must not read
           # as "everything is fine".
           if [ "$DETECTION" != "DETECTION_COMPLETE" ]; then
-            echo "::error::Drift detection did not complete (status: '${DETECTION:-empty}'). Treating as failure - a drift check that cannot report is not a passing check."
+            echo "::error::Drift detection did not complete (status: '${DETECTION:-empty}', reason: ${REASON}). Treating as failure - a drift check that cannot report is not a passing check."
             exit 1
           fi
           case "$STATUS" in
