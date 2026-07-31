@@ -25,6 +25,7 @@ import logging
 import os
 import tempfile
 import zipfile
+import zlib
 from typing import Any
 from urllib.parse import unquote_plus
 
@@ -56,6 +57,23 @@ ARCHIVE_STORAGE_CLASS = os.environ.get("ARCHIVE_STORAGE_CLASS", "STANDARD")
 SPOOL_MAX_BYTES = int(os.environ.get("SPOOL_MAX_BYTES", str(32 * 1024 * 1024)))
 CHUNK_BYTES = 1024 * 1024
 
+# Not everything is worth compressing. Data that is already entropy-coded - JPEG,
+# PNG, MP4, an existing archive - has no redundancy left to find, and DEFLATE
+# spends CPU to produce output slightly LARGER than its input:
+#
+#   200,000 bytes of random data  ->  200,165 bytes deflated
+#
+# Since the original is then deleted, compressing such an object costs money and
+# leaves more bytes stored than before. The first slice of the stream is trial
+# compressed to decide the method for the whole object; a sample is enough
+# because entropy is a property of the data, not of where you look in it.
+COMPRESSION_SAMPLE_BYTES = int(os.environ.get("COMPRESSION_SAMPLE_BYTES", str(256 * 1024)))
+
+# The gain the sample must show for compressing the whole object to be worth it.
+# 5% is deliberately low: the aim is to catch data that cannot compress at all,
+# not to second-guess data that compresses modestly.
+MIN_COMPRESSION_GAIN = float(os.environ.get("MIN_COMPRESSION_GAIN", "0.05"))
+
 # Adaptive retries so throttling under a burst of notifications backs off rather
 # than hammering S3 and burning billed duration.
 _s3 = boto3.client(
@@ -67,6 +85,25 @@ _s3 = boto3.client(
 def _log(event: str, **fields: Any) -> None:
     """Emit a single-line JSON log so CloudWatch Logs Insights can query fields."""
     LOGGER.info(json.dumps({"event": event, **fields}))
+
+
+def choose_compression(sample: bytes) -> tuple[int, float]:
+    """Decide whether compressing this object is worth the CPU.
+
+    Returns the zipfile compression constant and the gain the sample achieved.
+    ZIP_STORED still produces a valid archive, so the bucket layout and the
+    "everything under archive/ is a .zip" contract are unaffected - the entry is
+    simply stored rather than deflated.
+    """
+    if not sample:
+        return zipfile.ZIP_STORED, 0.0
+
+    compressed = zlib.compress(sample, COMPRESSION_LEVEL)
+    gain = 1 - len(compressed) / len(sample)
+
+    if gain < MIN_COMPRESSION_GAIN:
+        return zipfile.ZIP_STORED, gain
+    return zipfile.ZIP_DEFLATED, gain
 
 
 def archive_key_for(source_key: str) -> str:
@@ -112,18 +149,25 @@ def compress_object(bucket: str, key: str) -> dict[str, Any] | None:
     original_bytes = source["ContentLength"]
     member_name = os.path.basename(key)
 
+    body = source["Body"]
+
+    # Read the first slice up front and trial compress it. The sample is written
+    # into the archive along with the rest, so nothing is read twice.
+    sample = body.read(COMPRESSION_SAMPLE_BYTES)
+    method, sample_gain = choose_compression(sample)
+
     buffer = tempfile.SpooledTemporaryFile(max_size=SPOOL_MAX_BYTES)
     try:
         with zipfile.ZipFile(
             buffer,
             mode="w",
-            compression=zipfile.ZIP_DEFLATED,
+            compression=method,
             compresslevel=COMPRESSION_LEVEL,
         ) as archive:
             # force_zip64 because the final size is unknown while streaming, and
             # members above 2 GiB need the ZIP64 extensions.
             with archive.open(member_name, mode="w", force_zip64=True) as member:
-                body = source["Body"]
+                member.write(sample)
                 while chunk := body.read(CHUNK_BYTES):
                     member.write(chunk)
 
@@ -165,6 +209,11 @@ def compress_object(bucket: str, key: str) -> dict[str, Any] | None:
         "original_bytes": original_bytes,
         "compressed_bytes": compressed_bytes,
         "compression_ratio": round(ratio, 4),
+        # Recorded so the decision is visible in CloudWatch Logs Insights: a
+        # sudden rise in stored entries means the incoming data changed
+        # character, which is worth knowing before the storage bill says so.
+        "method": "stored" if method == zipfile.ZIP_STORED else "deflated",
+        "sample_gain": round(sample_gain, 4),
     }
     _log("archived", **summary)
     return summary
