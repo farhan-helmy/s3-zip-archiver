@@ -179,3 +179,48 @@ def test_archives_honour_a_configured_storage_class(s3, monkeypatch):
 
     head = s3.head_object(Bucket=BUCKET, Key="archive/result.json.zip")
     assert head["StorageClass"] == "GLACIER_IR"
+
+
+def test_incompressible_data_is_stored_not_deflated(s3, app):
+    """Already-compressed input must not be deflated.
+
+    DEFLATE on high-entropy data produces output larger than its input, and the
+    original is deleted afterwards - so compressing it would spend CPU to end up
+    storing more bytes than before.
+    """
+    import os as _os
+
+    random_bytes = _os.urandom(300_000)
+    s3.put_object(Bucket=BUCKET, Key="incoming/photo.png", Body=random_bytes)
+
+    result = app.lambda_handler(s3_event(BUCKET, "incoming/photo.png"), None)
+
+    summary = result["results"][0]
+    assert summary["method"] == "stored"
+    # A stored entry carries only ZIP framing, so it must not balloon the way a
+    # deflated one would.
+    assert summary["compressed_bytes"] < summary["original_bytes"] * 1.01
+
+
+def test_compressible_data_is_still_deflated(s3, app):
+    put_source(s3, "incoming/result.json")
+
+    result = app.lambda_handler(s3_event(BUCKET, "incoming/result.json"), None)
+
+    summary = result["results"][0]
+    assert summary["method"] == "deflated"
+    assert summary["compression_ratio"] > 0.5
+
+
+def test_stored_archives_still_extract(s3, app):
+    """Storing rather than deflating must not change the archive's contract."""
+    import os as _os
+
+    payload = _os.urandom(200_000)
+    s3.put_object(Bucket=BUCKET, Key="incoming/blob.bin", Body=payload)
+
+    app.lambda_handler(s3_event(BUCKET, "incoming/blob.bin"), None)
+
+    body = s3.get_object(Bucket=BUCKET, Key="archive/blob.bin.zip")["Body"].read()
+    with zipfile.ZipFile(io.BytesIO(body)) as archive:
+        assert archive.read("blob.bin") == payload

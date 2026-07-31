@@ -183,6 +183,36 @@ present in the AWS base image. There is no `requirements.txt` and no `pip` layer
 Dockerfile, so the image is small, builds fast, and carries **zero third-party supply-chain
 surface**.
 
+### Not compressing what cannot be compressed
+
+Data that is already entropy-coded — JPEG, PNG, video, an existing archive — has no
+redundancy left for DEFLATE to find, and compressing it produces output *larger* than the
+input while burning CPU to discover that. Since the original is deleted afterwards, doing
+so costs money and leaves more bytes stored than before.
+
+The handler trial-compresses the first 256 KB and stores the entry uncompressed when the
+sample gains less than 5%. A sample is sufficient because entropy is a property of the data
+rather than of where you sample it, and the sample is written into the archive along with
+the rest, so nothing is read twice.
+
+| Input | Before | After | Method chosen |
+|---|---:|---:|---|
+| Random bytes (200 KB) | +0.08% | **+0.05%** | stored |
+| Already-gzipped | +0.08% | **+0.05%** | stored |
+| Repetitive JSON | −99.74% | −99.74% | deflated |
+
+The archive is still a valid ZIP either way, so the "everything under `archive/` is a
+`.zip`" contract is unaffected — the entry is stored rather than deflated. The decision is
+recorded in the structured log as `method`, so a sudden rise in stored entries shows that
+the incoming data has changed character, ideally before the storage bill says so.
+
+**What this does not fix:** ZIP framing costs roughly 100 bytes per archive, so a very small
+object still grows — an 11-byte file becomes a 111-byte archive. The alternative was to skip
+small objects entirely, which would leave them sitting in `incoming/` indefinitely and break
+the invariant that the prefix is transient. Storing a slightly larger archive is the better
+trade at a 10 MB average file size, but it would be the wrong one for a workload of tiny
+files.
+
 ### Streaming, not buffering
 
 Objects are streamed from S3 through `zipfile` into a spooled buffer that stays in memory
@@ -785,6 +815,7 @@ attestations but leaves the OCI media type. The working build needs
 its minimum value of [10].` The account's *total* Lambda concurrency is 10, so no
 reservation is possible. Now conditional, and omitted rather than sent as `0` — which
 Lambda would interpret as "throttle this function to zero".
+
 
 **3. GitHub OIDC failed with a correct-looking trust policy.**
 `Not authorized to perform sts:AssumeRoleWithWebIdentity`, despite the role ARN, audience
