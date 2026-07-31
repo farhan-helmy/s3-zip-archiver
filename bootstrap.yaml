@@ -351,11 +351,20 @@ Resources:
                   # Drift detection is read-only despite the verb.
                   - cloudformation:DetectStackDrift
                   - cloudformation:DetectStackResourceDrift
-                  - cloudformation:DescribeStackDriftDetectionStatus
                   - cloudformation:DescribeStackResourceDrifts
                 Resource:
                   - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${GitHubRepo}/*"
                   - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31"
+
+              - Sid: PollDriftDetectionStatus
+                Effect: Allow
+                # This one takes a detection ID rather than a stack ARN, so it
+                # cannot be resource-scoped and IAM denies it under a stack-scoped
+                # statement. Found by running the drift workflow: DetectStackDrift
+                # succeeded, polling its result was denied, and the workflow
+                # reported no drift because the failure produced an empty answer.
+                Action: cloudformation:DescribeStackDriftDetectionStatus
+                Resource: "*"
 
               # Note the absence of ExecuteChangeSet, UpdateStack, CreateStack
               # and DeleteStack. That absence is the entire point of this role.

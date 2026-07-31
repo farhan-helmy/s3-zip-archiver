@@ -40,10 +40,19 @@ jobs:
 
       - name: Detect drift
         id: drift
+        # Fail loudly rather than quietly. Without this the step reported "no
+        # drift" when the polling call was actually denied by IAM: the error went
+        # to stderr, the result was empty, the comparison against "DRIFTED" was
+        # false, and the run went green. A drift check that cannot fail is worse
+        # than no drift check, because it is trusted.
         run: |
+          set -euo pipefail
+
           ID=$(aws cloudformation detect-stack-drift --stack-name "${STACK_NAME}" \
                  --query StackDriftDetectionId --output text)
+          [ -n "$ID" ] && [ "$ID" != "None" ] || { echo "::error::No detection id returned"; exit 1; }
 
+          DETECTION=""; STATUS=""; COUNT=""
           for _ in $(seq 1 40); do
             read -r DETECTION STATUS COUNT <<< "$(aws cloudformation \
               describe-stack-drift-detection-status --stack-drift-detection-id "$ID" \
@@ -54,6 +63,19 @@ jobs:
           done
 
           echo "Detection: $DETECTION | Stack: $STATUS | Drifted: $COUNT"
+
+          # Anything other than a completed detection with a recognised status
+          # means we do not know the answer, and "we do not know" must not read
+          # as "everything is fine".
+          if [ "$DETECTION" != "DETECTION_COMPLETE" ]; then
+            echo "::error::Drift detection did not complete (status: '${DETECTION:-empty}'). Treating as failure - a drift check that cannot report is not a passing check."
+            exit 1
+          fi
+          case "$STATUS" in
+            DRIFTED|IN_SYNC) ;;
+            *) echo "::error::Unrecognised drift status: '${STATUS:-empty}'"; exit 1 ;;
+          esac
+
           echo "status=$STATUS" >> "$GITHUB_OUTPUT"
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
 
