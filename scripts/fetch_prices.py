@@ -122,7 +122,8 @@ def main() -> None:
             print(f"  ?  {label:<36} not returned by the API")
             continue
         if expected is None:
-            values = ", ".join(f"{e['price']:g}" for e in sorted(entries, key=lambda p: -p["price"]))
+            ordered = sorted(entries, key=lambda p: -p["price"])
+            values = ", ".join(f"{e['price']:g}" for e in ordered)
             print(f"  -  {label:<36} tiered: {values}")
             continue
         actual = min(e["price"] for e in entries)
