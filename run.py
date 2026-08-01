@@ -163,27 +163,41 @@ def deploy() -> None:
         )
 
     registry = f"{account_id()}.dkr.ecr.{REGION}.amazonaws.com"
-    image = f"{registry}/{ECR_REPO}:{git_sha()}"
+    sha = git_sha()
+    image = f"{registry}/{ECR_REPO}:{sha}"
 
-    password = aws("ecr", "get-login-password")
-    subprocess.run(
-        ["docker", "login", "--username", "AWS", "--password-stdin", registry],
-        input=password, text=True, check=True,
+    # ECR tags are immutable, so pushing a commit CI has already built fails with
+    # "the tag is immutable". The image for a given commit is the same image, so
+    # skipping is correct rather than a workaround. CI does the same check.
+    exists = aws(
+        "ecr", "describe-images",
+        "--repository-name", ECR_REPO,
+        "--image-ids", f"imageTag={sha}",
+        check=False,
     )
 
-    # oci-mediatypes=false is required: BuildKit emits OCI manifests by default
-    # and Lambda rejects them with "The image manifest, config or layer media
-    # type for the source image is not supported". Provenance and SBOM
-    # attestations are off for the same reason - they make the push a
-    # multi-manifest index.
-    run(
-        "docker", "buildx", "build",
-        "--platform", "linux/amd64",
-        "--provenance=false",
-        "--sbom=false",
-        "--output", f"type=image,name={image},oci-mediatypes=false,push=true",
-        "src/",
-    )
+    if exists:
+        print(f"Image {sha} already in ECR, skipping build and push.")
+    else:
+        password = aws("ecr", "get-login-password")
+        subprocess.run(
+            ["docker", "login", "--username", "AWS", "--password-stdin", registry],
+            input=password, text=True, check=True,
+        )
+
+        # oci-mediatypes=false is required: BuildKit emits OCI manifests by
+        # default and Lambda rejects them with "The image manifest, config or
+        # layer media type for the source image is not supported". Provenance and
+        # SBOM attestations are off for the same reason - they make the push a
+        # multi-manifest index.
+        run(
+            "docker", "buildx", "build",
+            "--platform", "linux/amd64",
+            "--provenance=false",
+            "--sbom=false",
+            "--output", f"type=image,name={image},oci-mediatypes=false,push=true",
+            "src/",
+        )
 
     run(
         "sam", "deploy",
