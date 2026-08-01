@@ -54,6 +54,16 @@ validate: ## Validate the SAM template
 .PHONY: check
 check: lint test validate ## Everything CI runs on a pull request
 
+.PHONY: costs
+costs: ## Recompute the cost analysis (no AWS needed)
+	$(PY) scripts/cost_model.py
+
+.PHONY: prices
+prices: ## Re-verify cost model prices against the AWS Price List API
+	@# Deliberately outside `check`: this one needs credentials, and `check`
+	@# is meant to run offline so a reviewer can reproduce it.
+	$(PY) scripts/fetch_prices.py --profile $(PROFILE)
+
 # ---------------------------------------------------------------------------
 # Deployment
 # ---------------------------------------------------------------------------
