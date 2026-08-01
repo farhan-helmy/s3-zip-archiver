@@ -95,7 +95,9 @@ def deploy_params() -> list[str]:
 @command
 def install() -> None:
     """Create the dev virtualenv and install tooling."""
-    run("uv", "venv", "--python", "3.12", ".venv")
+    # --clear so re-running is not an error. Without it uv refuses when .venv
+    # already exists, which makes this work exactly once per clone.
+    run("uv", "venv", "--clear", "--python", "3.12", ".venv")
     run("uv", "pip", "install", "--python", f"{VENV}/python", "-r", "requirements-dev.txt")
 
 
