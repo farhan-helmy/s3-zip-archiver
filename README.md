@@ -78,19 +78,20 @@ pipeline cannot trigger itself.
 
 ## Quick start
 
-Needs the AWS CLI, SAM CLI, Docker, `uv` and `make`.
+Needs the AWS CLI, SAM CLI, Docker and `uv`.
 
 ```bash
-make install      # dev virtualenv and tooling
-make check        # lint, tests, template validation - no AWS needed
+python3 run.py install      # dev virtualenv and tooling
+python3 run.py check        # lint, tests, template validation - no AWS needed
 
-make bootstrap    # one-time: ECR repository, CI roles
-make deploy       # build, push, deploy, publish a version
-make smoke        # end-to-end test against the live stack
+python3 run.py bootstrap    # one-time: ECR repository, CI roles
+python3 run.py deploy       # build, push, deploy, publish a version
+python3 run.py smoke        # end-to-end test against the live stack
 ```
 
-Override defaults with `make deploy STACK=my-stack REGION=eu-west-1 PROFILE=my-profile`.
-`make help` lists everything.
+Override defaults with `STACK=my-stack REGION=eu-west-1 PROFILE=my-profile python3 run.py deploy`.
+`python3 run.py help` lists everything. The script is standard library only, so it needs no
+setup of its own.
 
 ## How it works
 
@@ -207,7 +208,7 @@ No `requirements.txt`, no pip layer, no third-party supply-chain surface.
 ## Verified deployment
 
 ```
-$ make smoke
+$ python3 run.py smoke
 Stack:  s3-zip-archiver (ap-southeast-1)
 Bucket: s3-zip-archiver-190930221916
 
@@ -255,12 +256,12 @@ choosing a diff you can read.
 The S3 notification invokes the `live` alias, not `$LATEST`, so moving the alias moves production
 traffic.
 
-Two mechanics make this work, and both are easy to get wrong:
+Two mechanics carry this, and both are easy to get wrong:
 
 **Image tags must be immutable.** SAM publishes a version only when the `ImageUri` string
 changes. Deploying `:latest` produces an identical URI, CloudFormation detects no change, and no
 version is published — a template that appears to implement versioning while doing nothing.
-Images are tagged with the commit SHA and ECR is set to `IMMUTABLE`. `make deploy` refuses a
+Images are tagged with the commit SHA and ECR is set to `IMMUTABLE`. `python3 run.py deploy` refuses a
 dirty worktree for the same reason.
 
 **Config changes must publish versions too.** `AutoPublishAlias` keys the version on `ImageUri`
@@ -274,8 +275,8 @@ serving the old version. Observed here: `CompressionLevel` changed 6 → 9, depl
 Run the **Rollback** workflow from the Actions tab with a version and a reason, or locally:
 
 ```bash
-make versions              # what exists, and what live serves
-make rollback VERSION=8
+python3 run.py versions              # what exists, and what live serves
+python3 run.py rollback 8
 ```
 
 | | `redeploy` (default) | `alias` |
@@ -298,14 +299,14 @@ serves, and a redeploy that would produce an empty change set.
 
 ## Configuration
 
-Configuration lives in [`deploy.params`](deploy.params), read by both `make deploy` and CI.
+Configuration lives in [`deploy.params`](deploy.params), read by both `python3 run.py deploy` and CI.
 Changing it is an ordinary commit:
 
 ```bash
 vim deploy.params
 git commit -am "config: write archives to Glacier Instant Retrieval"
 git push                   # CI deploys and publishes a version
-make config                # declared vs deployed
+python3 run.py config                # declared vs deployed
 ```
 
 The full parameter set is passed on every deploy. SAM keeps the stack's previous value for
@@ -325,14 +326,14 @@ failed object stays in `incoming/` unprocessed.
 
 | Alarm | Means | Action |
 |---|---|---|
-| `compressor-errors` | Compression failing | `make logs`; objects accumulating in `incoming/` |
-| `dlq-not-empty` | Events exhausted retries | `make dlq`, inspect, fix, re-upload |
+| `compressor-errors` | Compression failing | `python3 run.py logs`; objects accumulating in `incoming/` |
+| `dlq-not-empty` | Events exhausted retries | `python3 run.py dlq`, inspect, fix, re-upload |
 | `compressor-throttles` | Concurrency limit reached | Raise the Lambda quota |
 
 ```bash
-make logs      # tail function logs
-make dlq       # count permanently failed events
-make outputs   # bucket, alias ARN, queue URL, VPC ids
+python3 run.py logs      # tail function logs
+python3 run.py dlq       # count permanently failed events
+python3 run.py outputs   # bucket, alias ARN, queue URL, VPC ids
 ```
 
 Logs are structured JSON, so Logs Insights can aggregate directly:
@@ -350,7 +351,7 @@ by AWS. No `terraform.tfstate`, no S3 backend, no lock table. CloudFormation als
 deployed template, retrievable with `get-template`.
 
 ```bash
-make drift
+python3 run.py drift
 ```
 
 A scheduled workflow runs this daily and opens a GitHub issue when the stack stops matching the
@@ -360,10 +361,10 @@ repository.
 template, never against reality — there is no `terraform refresh`. Tested on this stack:
 
 ```
-$ make drift
+$ python3 run.py drift
 CompressorLogGroup   AWS::Logs::LogGroup   /RetentionInDays   14   30
 
-$ make deploy               # identical template and parameters
+$ python3 run.py deploy               # identical template and parameters
 No changes to deploy. Stack s3-zip-archiver is up to date
 
 $ aws logs describe-log-groups ... --query 'logGroups[0].retentionInDays'
@@ -376,7 +377,7 @@ deploy, then change it back. Two deploys to restore one setting.
 A deleted resource is worse, because it fails later rather than now. Deleting the throttle alarm
 by hand produced:
 
-1. `make drift` reported `ThrottleAlarm  AWS::CloudWatch::Alarm  DELETED`.
+1. `python3 run.py drift` reported `ThrottleAlarm  AWS::CloudWatch::Alarm  DELETED`.
 2. Redeploying said `No changes to deploy`. The alarm was not recreated. Monitoring was gone and
    CI stayed green.
 3. A later unrelated deploy touching that alarm failed: `not found and cannot be updated`.
@@ -389,7 +390,7 @@ Recovery took three manual steps:
 aws cloudformation continue-update-rollback --stack-name s3-zip-archiver \
   --resources-to-skip ThrottleAlarm
 aws cloudwatch put-metric-alarm --alarm-name s3-zip-archiver-compressor-throttles ...
-make deploy
+python3 run.py deploy
 ```
 
 **Renaming the bucket** is not possible: S3 has no rename API. The equivalent hazard is in the
@@ -403,11 +404,11 @@ stack policies.
 ### Teardown
 
 ```bash
-make destroy
+python3 run.py destroy
 ```
 
 The bucket is retained deliberately. Removing it is an explicit, irreversible action, and
-`make destroy` prints the command rather than running it.
+`python3 run.py destroy` prints the command rather than running it.
 
 ## Cost analysis
 
@@ -587,7 +588,7 @@ algorithm tuning, because it removes the repeated keys rather than encoding them
   absolute figure scales down linearly while the ratios and conclusions hold.
 - The 83.19% ratio is measured against representative synthetic JSON
   ([`scripts/generate_sample.py`](scripts/generate_sample.py)). Real payloads with more entropy
-  compress less. Re-measure against real data with `make smoke`.
+  compress less. Re-measure against real data with `python3 run.py smoke`.
 - Compute is priced at the measured warm duration. Cold starts add ~1,021 ms of init; at sustained
   volume most invocations are warm, but a bursty arrival pattern raises compute cost.
 - Storage tiers assume this data dominates the account's S3 usage.
@@ -738,7 +739,7 @@ to the alias method, which removes the drift rather than adding to it.
 ├── bootstrap.yaml             # one-time: ECR repository, CI roles
 ├── deploy.params              # deployed configuration - the source of truth
 ├── samconfig.toml             # SAM CLI defaults
-├── Makefile                   # build, deploy, smoke, rollback, drift, teardown
+├── run.py                     # project commands - stdlib only, no setup needed
 ├── src/
 │   ├── app.py                 # the handler
 │   ├── Dockerfile             # dependency-free image on the AWS base
@@ -747,7 +748,6 @@ to the alias method, which removes the drift rather than adding to it.
 │   ├── conftest.py
 │   └── test_handler.py        # 15 tests, moto-backed, no AWS account needed
 ├── scripts/
-│   ├── smoke.sh               # end-to-end test with round-trip integrity check
 │   ├── generate_sample.py     # representative video-analysis JSON
 │   ├── cost_model.py          # every figure in the cost analysis
 │   └── fetch_prices.py        # re-verify prices against the AWS Price List API
@@ -764,7 +764,7 @@ to the alias method, which removes the drift rather than adding to it.
 
 **CI** runs on every pull request and needs no AWS credentials: `ruff`, `cfn-lint`, `sam validate`
 and the moto-backed tests all run offline. Fork PRs are safe to validate and anyone cloning the
-repository can reproduce the check with `make check`.
+repository can reproduce the check with `python3 run.py check`.
 
 **Plan** creates a change set on pull requests touching infrastructure and posts the resource-level
 changes as a comment, including whether anything would be replaced. It cannot execute the change

@@ -19,7 +19,7 @@ fail_on_empty_changeset = false
 
 # image_repositories is deliberately absent too. SAM rejects a deploy that
 # specifies the image repository in both a config file and on the command line -
-# "Only one of the following can be provided" - and the Makefile and CI both
+# "Only one of the following can be provided" - and run.py and CI both
 # derive the registry from the account they are authenticated against rather
 # than hardcoding an account ID here.
 

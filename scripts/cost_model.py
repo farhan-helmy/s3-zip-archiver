@@ -7,7 +7,7 @@ script, so the arithmetic can be checked and re-run rather than taken on trust.
 Prices are ap-southeast-1 on-demand, pulled from the AWS Pricing API
 (`aws pricing get-products --region us-east-1 --service-code ...`) in July 2026.
 Compression ratio and Lambda duration are measured from the deployed stack, not
-assumed - see scripts/smoke.sh.
+assumed - see the smoke command in run.py.
 
 Usage:
     python3 scripts/cost_model.py

@@ -3,7 +3,7 @@ name: CI
 # Runs on every pull request and on pushes to main. Deliberately requires no AWS
 # credentials at all: everything here is either static analysis or runs against
 # moto, so a fork PR can be validated safely and anyone cloning the repository
-# can reproduce the full check locally with `make check`.
+# can reproduce the full check locally with `python3 run.py check`.
 on:
   pull_request:
   push:
