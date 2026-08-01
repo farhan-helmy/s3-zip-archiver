@@ -36,23 +36,38 @@ EXPECTED = {
     "APS1-Request": ("Lambda requests", 0.0000002, "request"),
     "APS1-NatGateway-Hours": ("NAT Gateway hourly", 0.059, "hour"),
     "APS1-NatGateway-Bytes": ("NAT Gateway data processing", 0.059, "GB"),
+    "APS1-DataProcessing-Bytes": ("CloudWatch Logs ingestion", 0.70, "GB"),
+    "APS1-CW:AlarmMonitorUsage": ("CloudWatch alarm", 0.10, "alarm-Mo"),
 }
 
+# service -> (usagetype prefixes to keep, extra API filters)
+#
+# EC2 needs a productFamily filter. It publishes tens of thousands of products
+# and the NAT Gateway entries fall outside any sane page limit, so an
+# unfiltered query silently returns no NAT prices at all.
 SERVICES = {
-    "AmazonS3": ["APS1-TimedStorage", "APS1-Requests"],
-    "AWSLambda": ["APS1-Lambda-GB-Second", "APS1-Request"],
-    "AmazonEC2": ["APS1-NatGateway"],
-    "AmazonCloudWatch": ["APS1-DataProcessing-Bytes", "APS1-CW:AlarmMonitorUsage"],
+    "AmazonS3": (["APS1-TimedStorage", "APS1-Requests"], []),
+    "AWSLambda": (["APS1-Lambda-GB-Second", "APS1-Request"], []),
+    "AmazonEC2": (
+        ["APS1-NatGateway"],
+        ["Type=TERM_MATCH,Field=productFamily,Value=NAT Gateway"],
+    ),
+    "AmazonCloudWatch": (
+        ["APS1-DataProcessing-Bytes", "APS1-CW:AlarmMonitorUsage"],
+        [],
+    ),
 }
 
 
-def query(service: str, profile: str | None) -> list[dict]:
-    """Ask the Price List API for every on-demand price in the region."""
+def query(service: str, extra_filters: list[str], profile: str | None) -> list[dict]:
+    """Ask the Price List API for on-demand prices in the region."""
     command = [
         "aws", "pricing", "get-products",
         "--service-code", service,
         "--region", "us-east-1",
         "--filters", f"Type=TERM_MATCH,Field=location,Value={REGION_NAME}",
+        *([f for pair in [("--filters", f) for f in extra_filters] for f in pair]
+          if extra_filters else []),
         "--max-items", "500",
         "--output", "json",
     ]
@@ -70,7 +85,11 @@ def query(service: str, profile: str | None) -> list[dict]:
         usagetype = product["product"]["attributes"].get("usagetype", "")
         for term in product["terms"].get("OnDemand", {}).values():
             for dimension in term["priceDimensions"].values():
-                value = float(dimension["pricePerUnit"]["USD"])
+                # Not every dimension is priced in USD - some carry CNY only.
+                raw = dimension["pricePerUnit"].get("USD")
+                if raw is None:
+                    continue
+                value = float(raw)
                 if value == 0:
                     continue
                 prices.append({
@@ -90,8 +109,8 @@ def main() -> None:
     print(f"AWS Price List API - on-demand, {REGION_NAME}\n")
 
     found: dict[str, list[dict]] = {}
-    for service, prefixes in SERVICES.items():
-        for price in query(service, args.profile):
+    for service, (prefixes, extra_filters) in SERVICES.items():
+        for price in query(service, extra_filters, args.profile):
             if any(price["usagetype"].startswith(p) for p in prefixes):
                 found.setdefault(price["usagetype"], []).append(price)
 
